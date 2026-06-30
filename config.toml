@@ -1,0 +1,17 @@
+# MAVLink connection to the autopilot
+connection_url = "udp://:14552"
+
+# u-blox PointPerfect (Thingstream) MQTT correction service.
+# Credentials are found under the Thing's Credentials tab > MQTT Credentials.
+mqtt_server_uri = "ssl://pp.services.u-blox.com:8883"
+mqtt_client_id = "your_client_id_goes_here"
+client_cert_path = "/opt/ark/share/pointperfect/device-pp-cert.crt"
+client_key_path = "/opt/ark/share/pointperfect/device-pp-key.pem"
+root_ca_path = "/opt/ark/share/pointperfect/root.crt"
+
+# Correction region: "us" or "eu"
+region = "us"
+
+# Subscribe to the dynamic decryption key topic and forward the UBX-RXM-SPARTNKEY
+# messages to the receiver so it can decrypt the SPARTN stream.
+enable_key_distribution = true
