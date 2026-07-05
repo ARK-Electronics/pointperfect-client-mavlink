@@ -12,6 +12,11 @@ popd > /dev/null
 sudo mkdir -p /opt/ark/bin
 sudo cp "$THIS_DIR/build/pointperfect-client-mavlink" /opt/ark/bin/
 
-# Install default config
+# Install default config, preserving an existing one (it carries the user's
+# MQTT client id and credential paths)
 sudo mkdir -p /opt/ark/share/pointperfect
-sudo cp "$THIS_DIR/config.toml" /opt/ark/share/pointperfect/
+if [ -f /opt/ark/share/pointperfect/config.toml ]; then
+	echo "Existing config preserved: /opt/ark/share/pointperfect/config.toml"
+else
+	sudo cp "$THIS_DIR/config.toml" /opt/ark/share/pointperfect/
+fi

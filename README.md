@@ -1,7 +1,7 @@
 ## u-blox PointPerfect Client for MAVLink
 This application connects to u-blox's [PointPerfect](https://www.u-blox.com/en/product/pointperfect) GNSS corrections service (delivered via the Thingstream MQTT broker) and forwards the SPARTN correction data to a flight controller via MAVLink.
 
-You must first create a Thingstream account, activate a PointPerfect plan on a *Thing*, and copy the MQTT credentials (client certificate, client key, and root CA) into the config file. <br>
+You must first create a Thingstream account, activate a PointPerfect **IP** (or IP + L-band) plan on a *Thing*, and copy the MQTT credentials (client certificate, client key, and root CA) into the config file. L-band-only plans do not provide the MQTT topics this client uses. <br>
 https://portal.thingstream.io/
 
 The **config.toml** file is used to configure the program settings. <br>
@@ -10,10 +10,12 @@ https://github.com/ARK-Electronics/pointperfect-client-mavlink/blob/main/config.
 ### Behavior
 The application waits for a MAVSDK connection. Once connected, it opens a TLS connection to the PointPerfect MQTT broker (`pp.services.u-blox.com:8883`) using the client certificate/key from the config and subscribes to:
 
-- `/pp/ip/<region>` — the SPARTN correction stream for your region (`us` or `eu`)
+- `/pp/ip/<region>` — the SPARTN correction stream for your region (`us`, `eu`, `au`, `kr`, or `jp`)
 - `/pp/ubx/0236/ip` — the dynamic decryption keys (`UBX-RXM-SPARTNKEY`), when `enable_key_distribution` is set
 
-Both the SPARTN corrections and the key messages are forwarded, unmodified, to the flight controller as [GPS_RTCM_DATA](https://mavlink.io/en/messages/common.html#GPS_RTCM_DATA) MAVLink messages (fragmented when larger than the message payload). The autopilot injects these bytes directly into the u-blox receiver, which uses the keys to decrypt the SPARTN stream and compute a high-precision fix.
+A single MQTT message can bundle several SPARTN frames and regularly exceeds the 720 bytes that one [GPS_RTCM_DATA](https://mavlink.io/en/messages/common.html#GPS_RTCM_DATA) sequence can carry (2-bit fragment id × 180-byte fragments), so the client splits each message at SPARTN/UBX frame boundaries and forwards every frame as its own GPS_RTCM_DATA sequence, fragmented as needed. The autopilot injects these bytes directly into the u-blox receiver, which uses the keys to decrypt the SPARTN stream and compute a high-precision fix.
+
+The receiver must accept SPARTN input on the port the autopilot injects into (e.g. ZED-F9P with HPG 1.30+ firmware).
 
 ### Credentials
 From the Thingstream portal, open your PointPerfect *Thing* → **Credentials** → **MQTT Credentials** and download the Client Certificate, Client Key, and Root Certificate. Point the config at their paths:

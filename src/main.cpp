@@ -4,6 +4,7 @@
 #include <iostream>
 #include <toml.hpp>
 #include <unistd.h>
+#include <utility>
 #include <sys/types.h>
 
 static void signal_handler(int signum);
@@ -49,15 +50,36 @@ int main(int argc, char** argv)
 	}
 
 	PointPerfectClientMavlink::Settings settings = {
-		.mavsdk_connection_url = config["connection_url"].value_or("0.0.0"),
+		.mavsdk_connection_url = config["connection_url"].value_or("udp://:14552"),
 		.mqtt_server_uri = config["mqtt_server_uri"].value_or("ssl://pp.services.u-blox.com:8883"),
-		.mqtt_client_id = config["mqtt_client_id"].value_or("<your_client_id_goes_here>"),
+		.mqtt_client_id = config["mqtt_client_id"].value_or(""),
 		.client_cert_path = config["client_cert_path"].value_or(""),
 		.client_key_path = config["client_key_path"].value_or(""),
 		.root_ca_path = config["root_ca_path"].value_or(""),
 		.region = config["region"].value_or("us"),
 		.enable_key_distribution = config["enable_key_distribution"].value_or(true)
 	};
+
+	// Fail fast with a clear message instead of a cryptic TLS/MQTT error later.
+	if (settings.mqtt_client_id.empty() || settings.mqtt_client_id.find("your_client_id") != std::string::npos) {
+		std::cerr << "mqtt_client_id is not set in " << config_path << "\n"
+			  "Copy the Client ID from the Thingstream portal: your Thing > Credentials > MQTT Credentials\n";
+		return -1;
+	}
+
+	const std::pair<const char*, const std::string*> credential_files[] = {
+		{"client_cert_path", &settings.client_cert_path},
+		{"client_key_path", &settings.client_key_path},
+		{"root_ca_path", &settings.root_ca_path},
+	};
+
+	for (const auto& [name, path] : credential_files) {
+		if (path->empty() || !std::filesystem::exists(*path)) {
+			std::cerr << name << " \"" << *path << "\" does not exist (configured in " << config_path << ")\n"
+				  "Download the MQTT credentials from the Thingstream portal: your Thing > Credentials\n";
+			return -1;
+		}
+	}
 
 	_pointperfect_client_mavlink = std::make_shared<PointPerfectClientMavlink>(settings);
 

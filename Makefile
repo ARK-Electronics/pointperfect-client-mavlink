@@ -1,7 +1,7 @@
 PROJECT_NAME="pointperfect-client-mavlink"
 
 all:
-	@astyle --quiet --options=astylerc src/*.cpp,*.hpp
+	@astyle --quiet --options=astylerc "src/*.cpp,*.hpp"
 	@cmake -Bbuild -H.; cmake --build build -j$(nproc)
 	@size build/${PROJECT_NAME}
 

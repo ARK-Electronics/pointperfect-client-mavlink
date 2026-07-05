@@ -9,7 +9,7 @@ client_cert_path = "/opt/ark/share/pointperfect/device-pp-cert.crt"
 client_key_path = "/opt/ark/share/pointperfect/device-pp-key.pem"
 root_ca_path = "/opt/ark/share/pointperfect/root.crt"
 
-# Correction region: "us" or "eu"
+# Correction region: "us", "eu", "au", "kr", or "jp"
 region = "us"
 
 # Subscribe to the dynamic decryption key topic and forward the UBX-RXM-SPARTNKEY

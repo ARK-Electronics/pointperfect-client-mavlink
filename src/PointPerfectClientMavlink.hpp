@@ -25,6 +25,8 @@ public:
 	PointPerfectClientMavlink(const Settings& settings);
 
 	void run();
+
+	// Signal-safe: only sets the exit flag. Cleanup happens in run().
 	void stop();
 
 	// mqtt::callback interface
@@ -33,13 +35,21 @@ public:
 	void message_arrived(mqtt::const_message_ptr msg) override;
 
 private:
+	// GPS_RTCM_DATA carries a 2-bit fragment id, so one sequence is at most
+	// 4 fragments of 180 bytes. Frames of this size or larger cannot be
+	// transported (an exact multiple of 180 also needs a zero-length
+	// terminating fragment).
+	static constexpr size_t MAX_SEQUENCE_LENGTH = 4 * MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN;
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	bool connect_pointperfect();
+	void disconnect_pointperfect();
 	void subscribe_topics();
+	void print_statistics();
 
-	// Forward a blob of correction bytes (SPARTN data or UBX keys) to the
-	// autopilot as one or more GPS_RTCM_DATA messages.
-	void forward_corrections(const uint8_t* data, size_t length);
+	// Forward a single frame (SPARTN or UBX) to the autopilot as one
+	// GPS_RTCM_DATA sequence, fragmenting if necessary.
+	void forward_frame(const uint8_t* data, size_t length);
 	void send_mavlink_gps_rtcm_data(const mavlink_gps_rtcm_data_t& msg);
 
 	// MAVSDK
@@ -48,6 +58,11 @@ private:
 	uint8_t _sequence_id = 0;
 	// PointPerfect MQTT
 	std::shared_ptr<mqtt::async_client> _mqtt_client;
+	// Statistics, written from the MQTT callback thread and read in run()
+	std::atomic<uint32_t> _messages_received {0};
+	std::atomic<uint32_t> _frames_forwarded {0};
+	std::atomic<uint32_t> _frames_dropped {0};
+	std::atomic<uint64_t> _bytes_forwarded {0};
 	// Other
 	Settings _settings;
 	std::atomic<bool> _should_exit = false;
