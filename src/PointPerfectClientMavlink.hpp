@@ -19,6 +19,10 @@ public:
 		std::string mavsdk_connection_url;
 		std::string ntrip_host;
 		int ntrip_port;
+		// Correction format: "rtcm" (default, supported by PX4) or "spartn".
+		std::string correction_format;
+		// Optional explicit mountpoint. When empty it is derived from
+		// correction_format (NEAR-RTCM / NEAR-SPARTN).
 		std::string ntrip_mountpoint;
 		std::string ntrip_username;
 		std::string ntrip_password;
@@ -71,5 +75,6 @@ private:
 	} _position = {};
 
 	Settings _settings;
+	std::string _mountpoint; // resolved from settings (explicit or format-derived)
 	std::atomic<bool> _should_exit = false;
 };

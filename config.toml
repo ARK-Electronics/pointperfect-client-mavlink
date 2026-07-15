@@ -6,7 +6,16 @@ connection_url = "udp://:14552"
 # Thing > Credentials. Each Thing allows a single simultaneous NTRIP connection.
 ntrip_host = "ppntrip.services.u-blox.com"
 ntrip_port = 2102          # 2102 = TLS, 2101 = plain TCP
-ntrip_mountpoint = "NEAR-SPARTN"
+
+# Correction format: "rtcm" (default, natively supported by PX4) or "spartn".
+# PX4 currently only injects/parses RTCM; use "spartn" only if your
+# receiver/firmware supports SPARTN forwarded over GPS_RTCM_DATA.
+correction_format = "rtcm"
+
+# Mountpoint. Leave empty to derive it from correction_format
+# (NEAR-RTCM or NEAR-SPARTN); set it explicitly to override.
+ntrip_mountpoint = ""
+
 ntrip_username = "your_username_goes_here"
 ntrip_password = "your_password_goes_here"
 

@@ -53,6 +53,23 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 		// https://mavsdk.mavlink.io/main/en/cpp/guide/logging.html
 		return true;
 	});
+
+	const bool use_spartn = (_settings.correction_format == "spartn");
+
+	// An explicit mountpoint wins; otherwise derive it from the format.
+	if (!_settings.ntrip_mountpoint.empty()) {
+		_mountpoint = _settings.ntrip_mountpoint;
+
+	} else {
+		_mountpoint = use_spartn ? "NEAR-SPARTN" : "NEAR-RTCM";
+	}
+
+	std::cout << "Correction format: " << (use_spartn ? "SPARTN" : "RTCM") << std::endl;
+
+	if (use_spartn) {
+		std::cout << "WARNING: PX4 currently only injects/parses RTCM. SPARTN requires "
+			  << "receiver/firmware support for GPS_RTCM_DATA-carried SPARTN." << std::endl;
+	}
 }
 
 PointPerfectClientMavlink::~PointPerfectClientMavlink()
@@ -147,7 +164,7 @@ bool PointPerfectClientMavlink::wait_for_mavsdk_connection(double timeout_s)
 bool PointPerfectClientMavlink::ntrip_connect()
 {
 	std::cout << "Connecting to NTRIP caster: " << _settings.ntrip_host << ":" << _settings.ntrip_port
-		  << "/" << _settings.ntrip_mountpoint << std::endl;
+		  << "/" << _mountpoint << std::endl;
 
 	// Resolve and connect the TCP socket
 	struct addrinfo hints = {};
@@ -210,7 +227,7 @@ bool PointPerfectClientMavlink::ntrip_connect()
 	// Send the NTRIP request
 	const std::string auth = base64_encode(_settings.ntrip_username + ":" + _settings.ntrip_password);
 	std::string request =
-		"GET /" + _settings.ntrip_mountpoint + " HTTP/1.1\r\n"
+		"GET /" + _mountpoint + " HTTP/1.1\r\n"
 		"Host: " + _settings.ntrip_host + ":" + port_str + "\r\n"
 		"Ntrip-Version: Ntrip/2.0\r\n"
 		"User-Agent: NTRIP pointperfect-client-mavlink/1.0\r\n"
