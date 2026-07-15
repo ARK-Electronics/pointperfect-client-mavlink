@@ -7,23 +7,8 @@ project(pointperfect-client-mavlink VERSION 0.9 LANGUAGES CXX)
 
 add_compile_options(-Wall -Wunused)
 
-# TLS for the MQTT connection to the PointPerfect broker
+# TLS for the NTRIP connection to the PointPerfect caster
 find_package(OpenSSL REQUIRED)
-
-# Fetch the Eclipse Paho MQTT C++ client (and build the bundled C client with it).
-include(FetchContent)
-set(PAHO_WITH_MQTT_C ON CACHE INTERNAL "")
-set(PAHO_WITH_SSL ON CACHE INTERNAL "")
-set(PAHO_BUILD_STATIC ON CACHE INTERNAL "")
-set(PAHO_BUILD_SHARED OFF CACHE INTERNAL "")
-set(PAHO_BUILD_SAMPLES OFF CACHE INTERNAL "")
-set(PAHO_BUILD_TESTS OFF CACHE INTERNAL "")
-set(PAHO_BUILD_DOCUMENTATION OFF CACHE INTERNAL "")
-FetchContent_Declare(
-    paho_mqtt_cpp
-    GIT_REPOSITORY https://github.com/eclipse-paho/paho.mqtt.cpp.git
-    GIT_TAG v1.4.1)
-FetchContent_MakeAvailable(paho_mqtt_cpp)
 
 # Assumes MAVSDK system wide install
 list(APPEND CMAKE_PREFIX_PATH "/usr/local/MAVSDK/install")
@@ -37,5 +22,6 @@ add_executable(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME}
     pthread
-    PahoMqttCpp::paho-mqttpp3-static
+    OpenSSL::SSL
+    OpenSSL::Crypto
     MAVSDK::mavsdk)

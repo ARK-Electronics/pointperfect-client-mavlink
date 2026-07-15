@@ -14,6 +14,7 @@ int main(int argc, char** argv)
 {
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+	signal(SIGPIPE, SIG_IGN); // Don't die on writes to a dropped NTRIP socket
 	setbuf(stdout, NULL); // Disable stdout buffering
 
 	// Config lookup: --config <path> (or --config=<path>) overrides everything;
@@ -50,13 +51,13 @@ int main(int argc, char** argv)
 
 	PointPerfectClientMavlink::Settings settings = {
 		.mavsdk_connection_url = config["connection_url"].value_or("0.0.0"),
-		.mqtt_server_uri = config["mqtt_server_uri"].value_or("ssl://pp.services.u-blox.com:8883"),
-		.mqtt_client_id = config["mqtt_client_id"].value_or("<your_client_id_goes_here>"),
-		.client_cert_path = config["client_cert_path"].value_or(""),
-		.client_key_path = config["client_key_path"].value_or(""),
-		.root_ca_path = config["root_ca_path"].value_or(""),
-		.region = config["region"].value_or("us"),
-		.enable_key_distribution = config["enable_key_distribution"].value_or(true)
+		.ntrip_host = config["ntrip_host"].value_or("ppntrip.services.u-blox.com"),
+		.ntrip_port = config["ntrip_port"].value_or(2102),
+		.ntrip_mountpoint = config["ntrip_mountpoint"].value_or("NEAR-SPARTN"),
+		.ntrip_username = config["ntrip_username"].value_or("<your_username_goes_here>"),
+		.ntrip_password = config["ntrip_password"].value_or("<your_password_goes_here>"),
+		.use_tls = config["use_tls"].value_or(true),
+		.send_gga = config["send_gga"].value_or(true)
 	};
 
 	_pointperfect_client_mavlink = std::make_shared<PointPerfectClientMavlink>(settings);
