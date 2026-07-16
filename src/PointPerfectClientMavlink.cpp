@@ -391,7 +391,32 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
 
-	if (msg.lat == 0 && msg.lon == 0) {
+	// Require a continuous >=2D fix for kStableFixDuration before reporting
+	// position to the NTRIP caster. Any drop below 2D resets the window.
+	const auto now = std::chrono::steady_clock::now();
+
+	if (msg.fix_type < kMinFixType) {
+		if (_fix_ok_since.has_value()) {
+			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type)
+				  << "), resetting stable-fix timer" << std::endl;
+		}
+
+		_fix_ok_since.reset();
+
+		std::lock_guard<std::mutex> lock(_position.lock);
+		_position.valid = false;
+		return;
+	}
+
+	if (!_fix_ok_since.has_value()) {
+		_fix_ok_since = now;
+		std::cout << "GPS >=2D fix acquired (fix_type=" << int(msg.fix_type)
+			  << "), waiting " << kStableFixDuration.count()
+			  << "s for stability" << std::endl;
+		return;
+	}
+
+	if (now - *_fix_ok_since < kStableFixDuration) {
 		return;
 	}
 
