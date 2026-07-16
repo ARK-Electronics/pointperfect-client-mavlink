@@ -11,6 +11,13 @@ correction_format = "rtcm"    # default; PX4-compatible
 ```
 The format selects the caster mountpoint (`NEAR-RTCM` / `NEAR-SPARTN`) automatically; set `ntrip_mountpoint` explicitly only if you need to override it.
 
+### AssistNow start-up assistance (MGA)
+For u-blox receivers, PointPerfect offers dedicated mountpoints (`NEAR-RTCM-MGA` / `NEAR-SPARTN-MGA`) that deliver AssistNow assistance data — live global GPS and Galileo ephemeris as UBX-MGA messages — once, immediately on connection, ahead of the correction stream. Fed to the receiver, this significantly reduces the time to first fix, which in turn lets the client report a valid position (GGA) to the caster sooner; the caster starts the correction stream only after it receives a valid GGA. Enable it with:
+```toml
+use_mga = true    # u-blox receivers only
+```
+The client extracts the UBX-MGA messages from the stream and forwards each one to the flight controller in its own `GPS_RTCM_DATA` sequence, paced 20 ms apart so the burst of assistance data (several KB at connect) does not overflow the autopilot's injection queue on its way to the receiver. `use_mga` requires `send_gga`, and selects the `-MGA` mountpoint automatically unless `ntrip_mountpoint` is set explicitly (an explicit `*-MGA` mountpoint gets the same forwarding treatment).
+
 You must first create a Thingstream account, activate a PointPerfect plan on a *Thing*, and copy the NTRIP credentials into the config file. <br>
 https://portal.thingstream.io/
 

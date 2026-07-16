@@ -18,7 +18,8 @@ include_directories(third_party/tomlplusplus/)
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
-    src/PointPerfectClientMavlink.cpp)
+    src/PointPerfectClientMavlink.cpp
+    src/UbxFrameScanner.cpp)
 
 target_link_libraries(${PROJECT_NAME}
     pthread

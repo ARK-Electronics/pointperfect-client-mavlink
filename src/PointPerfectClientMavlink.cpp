@@ -59,12 +59,17 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 
 	const bool use_spartn = (_settings.correction_format == "spartn");
 
-	// An explicit mountpoint wins; otherwise derive it from the format.
+	// An explicit mountpoint wins; otherwise derive it from the format. The
+	// *-MGA mountpoints prepend AssistNow ephemeris (UBX-MGA) for faster TTFF.
 	if (!_settings.ntrip_mountpoint.empty()) {
 		_mountpoint = _settings.ntrip_mountpoint;
 
 	} else {
 		_mountpoint = use_spartn ? "NEAR-SPARTN" : "NEAR-RTCM";
+
+		if (_settings.use_mga) {
+			_mountpoint += "-MGA";
+		}
 	}
 
 	std::cout << "Correction format: " << (use_spartn ? "SPARTN" : "RTCM") << std::endl;
@@ -72,6 +77,15 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 	if (use_spartn) {
 		std::cout << "WARNING: PX4 currently only injects/parses RTCM. SPARTN requires "
 			  << "receiver/firmware support for GPS_RTCM_DATA-carried SPARTN." << std::endl;
+	}
+
+	if (_settings.use_mga) {
+		std::cout << "MGA assistance data enabled (u-blox receivers only)" << std::endl;
+
+		if (!_settings.send_gga) {
+			std::cout << "WARNING: the MGA mountpoints only start the correction stream "
+				  << "after receiving a GGA report; enable send_gga." << std::endl;
+		}
 	}
 }
 
@@ -103,7 +117,6 @@ void PointPerfectClientMavlink::run()
 	});
 
 	uint8_t buffer[4096];
-	auto last_gga = std::chrono::steady_clock::now() - std::chrono::seconds(10);
 
 	while (!_should_exit) {
 
@@ -116,6 +129,12 @@ void PointPerfectClientMavlink::run()
 
 			continue;
 		}
+
+		// Report position immediately: the caster only starts (and keeps)
+		// streaming corrections once it has a GGA from this connection.
+		auto last_gga = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+		_last_stream_data = std::chrono::steady_clock::now();
+		_mga_messages_forwarded = 0;
 
 		// Stream corrections until the connection drops or we're asked to exit.
 		while (!_should_exit) {
@@ -134,9 +153,15 @@ void PointPerfectClientMavlink::run()
 			} else if (n < 0) {
 				std::cerr << "NTRIP connection lost" << std::endl;
 				break;
+
+			} else if (_scanner.buffered() > 0 && now - _last_stream_data >= kScannerIdleFlush) {
+				// Idle: a partial frame candidate is not going to complete.
+				_scanner.flush([this](const uint8_t* data, size_t length) { forward_raw(data, length); });
 			}
 		}
 
+		// Buffered partial data belongs to the old stream; drop it.
+		_scanner.reset();
 		ntrip_disconnect();
 	}
 }
@@ -480,7 +505,7 @@ bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 
 	// satellites_visible is UINT8_MAX when unknown
 	const unsigned sats = (satellites_visible == UINT8_MAX) ? 0u
-			     : std::min<unsigned>(satellites_visible, 99u);
+			      : std::min<unsigned>(satellites_visible, 99u);
 
 	// eph is HDOP * 100; UINT16_MAX when unknown
 	const double hdop = (eph == UINT16_MAX) ? 99.9 : (double(eph) / 100.0);
@@ -545,6 +570,46 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 
 	std::cout << "\nReceived " << length << " correction bytes" << std::endl;
 
+	_last_stream_data = std::chrono::steady_clock::now();
+
+	// UBX-MGA assistance (MGA mountpoints) is forwarded message-aligned and
+	// paced; everything else passes through unmodified.
+	_scanner.feed(data, length,
+	[this](const uint8_t* frame, size_t frame_length) { forward_ubx(frame, frame_length); },
+	[this](const uint8_t* raw, size_t raw_length) { forward_raw(raw, raw_length); });
+}
+
+void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)
+{
+	// The autopilot writes GPS_RTCM_DATA payloads to the receiver as-is, so
+	// UBX-MGA reaches the receiver on the same path as the corrections.
+	_mga_messages_forwarded++;
+
+	char msg_id[16];
+	snprintf(msg_id, sizeof(msg_id), "UBX-%02X-%02X", frame[2], frame[3]);
+	std::cout << "Forwarding MGA message " << _mga_messages_forwarded
+		  << " (" << msg_id << ", " << length << " bytes)" << std::endl;
+
+	send_sequence(frame, length);
+
+	if (!_should_exit) {
+		std::this_thread::sleep_for(kMgaMessageInterval);
+	}
+}
+
+void PointPerfectClientMavlink::forward_raw(const uint8_t* data, size_t length)
+{
+	size_t offset = 0;
+
+	while (offset < length) {
+		const size_t current_length = std::min(length - offset, kMaxSequenceLength);
+		send_sequence(data + offset, current_length);
+		offset += current_length;
+	}
+}
+
+void PointPerfectClientMavlink::send_sequence(const uint8_t* data, size_t length)
+{
 	mavlink_gps_rtcm_data_t msg = {};
 
 	if (length <= MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN) {
@@ -567,6 +632,16 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 			memcpy(&msg.data, data + start, current_length);
 			send_mavlink_gps_rtcm_data(msg);
 			start += current_length;
+		}
+
+		// A fragmented sequence ends with a fragment shorter than the field
+		// size; append an empty one when the length is an exact multiple.
+		if (length % MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN == 0 && fragment_id <= 3) {
+			msg.flags = 1;
+			msg.flags |= (fragment_id & 0x3) << 1;
+			msg.flags |= (_sequence_id & 0x1F) << 3;
+			msg.len = 0;
+			send_mavlink_gps_rtcm_data(msg);
 		}
 	}
 

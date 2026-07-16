@@ -58,7 +58,8 @@ int main(int argc, char** argv)
 		.ntrip_username = config["ntrip_username"].value_or("<your_username_goes_here>"),
 		.ntrip_password = config["ntrip_password"].value_or("<your_password_goes_here>"),
 		.use_tls = config["use_tls"].value_or(true),
-		.send_gga = config["send_gga"].value_or(true)
+		.send_gga = config["send_gga"].value_or(true),
+		.use_mga = config["use_mga"].value_or(false)
 	};
 
 	_pointperfect_client_mavlink = std::make_shared<PointPerfectClientMavlink>(settings);
