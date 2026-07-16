@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <memory>
 
@@ -37,6 +39,10 @@ public:
 	void stop();
 
 private:
+	// GPS_RAW_INT fix_type: 0-1 no fix, 2 = 2D, 3 = 3D, ...
+	static constexpr uint8_t kMinFixType = 2;
+	static constexpr std::chrono::seconds kStableFixDuration{3};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	void handle_gps_raw_int(const mavlink_message_t& message);
 
@@ -48,6 +54,7 @@ private:
 	bool read_ntrip_response(std::string& leftover);
 
 	// NMEA GGA position report sent to the caster
+	static uint8_t nmea_quality_from_fix_type(uint8_t fix_type);
 	bool build_gga(std::string& sentence);
 	void send_gga();
 
@@ -65,14 +72,20 @@ private:
 	SSL* _ssl = nullptr;
 	SSL_CTX* _ssl_ctx = nullptr;
 
-	// Latest vehicle position (WGS-84), used to build the GGA sentence
+	// Latest vehicle position + fix metadata from GPS_RAW_INT (for GGA)
 	struct GlobalPosition {
 		double lat_deg;
 		double lon_deg;
 		double alt_m;
+		uint8_t fix_type;
+		uint8_t satellites_visible;
+		uint16_t eph; // HDOP * 100; UINT16_MAX if unknown
 		bool valid;
 		std::mutex lock;
 	} _position = {};
+
+	// Tracks continuous >=2D fix so we only report position after a stable window.
+	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
 
 	Settings _settings;
 	std::string _mountpoint; // resolved from settings (explicit or format-derived)

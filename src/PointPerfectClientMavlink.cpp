@@ -6,7 +6,9 @@
 #include <thread>
 #include <cstring>
 #include <cerrno>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <ctime>
 
 #include <unistd.h>
@@ -391,7 +393,32 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
 
-	if (msg.lat == 0 && msg.lon == 0) {
+	// Require a continuous >=2D fix for kStableFixDuration before reporting
+	// position to the NTRIP caster. Any drop below 2D resets the window.
+	const auto now = std::chrono::steady_clock::now();
+
+	if (msg.fix_type < kMinFixType) {
+		if (_fix_ok_since.has_value()) {
+			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type)
+				  << "), resetting stable-fix timer" << std::endl;
+		}
+
+		_fix_ok_since.reset();
+
+		std::lock_guard<std::mutex> lock(_position.lock);
+		_position.valid = false;
+		return;
+	}
+
+	if (!_fix_ok_since.has_value()) {
+		_fix_ok_since = now;
+		std::cout << "GPS >=2D fix acquired (fix_type=" << int(msg.fix_type)
+			  << "), waiting " << kStableFixDuration.count()
+			  << "s for stability" << std::endl;
+		return;
+	}
+
+	if (now - *_fix_ok_since < kStableFixDuration) {
 		return;
 	}
 
@@ -399,12 +426,41 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	_position.lat_deg = double(msg.lat) / 1e7;
 	_position.lon_deg = double(msg.lon) / 1e7;
 	_position.alt_m = double(msg.alt) / 1e3;
+	_position.fix_type = msg.fix_type;
+	_position.satellites_visible = msg.satellites_visible;
+	_position.eph = msg.eph;
 	_position.valid = true;
+}
+
+uint8_t PointPerfectClientMavlink::nmea_quality_from_fix_type(uint8_t fix_type)
+{
+	// GPS_RAW_INT fix_type -> NMEA GGA quality indicator
+	// 0-1: no fix, 2: 2D, 3: 3D, 4: DGPS, 5: RTK float, 6: RTK fixed
+	switch (fix_type) {
+	case 2:
+	case 3:
+		return 1; // GPS SPS
+
+	case 4:
+		return 2; // DGPS
+
+	case 5:
+		return 5; // RTK float
+
+	case 6:
+		return 4; // RTK fixed
+
+	default:
+		return 0; // invalid / no fix
+	}
 }
 
 bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 {
 	double lat, lon, alt;
+	uint8_t fix_type;
+	uint8_t satellites_visible;
+	uint16_t eph;
 	{
 		std::lock_guard<std::mutex> lock(_position.lock);
 
@@ -415,7 +471,19 @@ bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 		lat = _position.lat_deg;
 		lon = _position.lon_deg;
 		alt = _position.alt_m;
+		fix_type = _position.fix_type;
+		satellites_visible = _position.satellites_visible;
+		eph = _position.eph;
 	}
+
+	const uint8_t quality = nmea_quality_from_fix_type(fix_type);
+
+	// satellites_visible is UINT8_MAX when unknown
+	const unsigned sats = (satellites_visible == UINT8_MAX) ? 0u
+			     : std::min<unsigned>(satellites_visible, 99u);
+
+	// eph is HDOP * 100; UINT16_MAX when unknown
+	const double hdop = (eph == UINT16_MAX) ? 99.9 : (double(eph) / 100.0);
 
 	// UTC time hhmmss.ss
 	std::time_t t = std::time(nullptr);
@@ -439,8 +507,9 @@ bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 
 	char body[128];
 	snprintf(body, sizeof(body),
-		 "GPGGA,%s,%02d%07.4f,%c,%03d%07.4f,%c,1,12,1.0,%.1f,M,0.0,M,,",
-		 utc, lat_deg, lat_min, ns, lon_deg, lon_min, ew, alt);
+		 "GPGGA,%s,%02d%07.4f,%c,%03d%07.4f,%c,%u,%02u,%.1f,%.1f,M,0.0,M,,",
+		 utc, lat_deg, lat_min, ns, lon_deg, lon_min, ew,
+		 unsigned(quality), sats, hdop, alt);
 
 	// NMEA checksum: XOR of all bytes between '$' and '*'
 	uint8_t checksum = 0;
