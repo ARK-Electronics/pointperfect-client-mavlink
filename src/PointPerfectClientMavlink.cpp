@@ -109,12 +109,19 @@ void PointPerfectClientMavlink::run()
 		}
 	}
 
-	// Track the vehicle position so we can report it to the NTRIP caster.
+	// Track GPS_RAW_INT for (1) receiver-up gate before NTRIP and (2) GGA.
 	_mavlink_passthrough->subscribe_message(
 		MAVLINK_MSG_ID_GPS_RAW_INT,
 	[this](const mavlink_message_t& message) {
 		handle_gps_raw_int(message);
 	});
+
+	// Do not open the caster until the GPS driver is publishing. On MGA
+	// mountpoints the assistance burst is one-shot at connect (and billed);
+	// if inject is still blocked mid-receiver-config those bytes are dropped.
+	if (!wait_for_gps_receiver()) {
+		return;
+	}
 
 	uint8_t buffer[4096];
 
@@ -186,6 +193,26 @@ bool PointPerfectClientMavlink::wait_for_mavsdk_connection(double timeout_s)
 	std::cout << "Connected to autopilot" << std::endl;
 	_mavlink_passthrough = std::make_shared<mavsdk::MavlinkPassthrough>(system.value());
 
+	return true;
+}
+
+bool PointPerfectClientMavlink::wait_for_gps_receiver()
+{
+	if (_gps_receiver_seen.load()) {
+		return true;
+	}
+
+	std::cout << "Waiting for GPS_RAW_INT (receiver up) before NTRIP connect..." << std::endl;
+
+	while (!_should_exit && !_gps_receiver_seen.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+
+	if (_should_exit) {
+		return false;
+	}
+
+	std::cout << "GPS receiver seen; safe to open NTRIP (MGA can be injected)" << std::endl;
 	return true;
 }
 
@@ -417,6 +444,10 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 {
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
+
+	// Any GPS_RAW_INT means the GPS driver is alive (even fix_type 0/1). Set
+	// once so wait_for_gps_receiver() can release; do not require a fix.
+	_gps_receiver_seen.store(true);
 
 	// Require a continuous >=2D fix for kStableFixDuration before reporting
 	// position to the NTRIP caster. Any drop below 2D resets the window.

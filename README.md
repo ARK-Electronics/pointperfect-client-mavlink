@@ -25,9 +25,9 @@ The **config.toml** file is used to configure the program settings. <br>
 https://github.com/ARK-Electronics/pointperfect-client-mavlink/blob/main/config.toml
 
 ### Behavior
-The application waits for a MAVSDK connection. Once connected, it opens an NTRIP connection to the PointPerfect caster (`ppntrip.services.u-blox.com`, TLS on port `2102` or plain TCP on `2101`), authenticates with the per-Thing username/password, and requests the mountpoint for the configured correction format.
+The application waits for a MAVSDK connection, then for the first [GPS_RAW_INT](https://mavlink.io/en/messages/common.html#GPS_RAW_INT) of any `fix_type` (including no-fix). That signals the GPS driver has finished configuring the receiver and will inject `GPS_RTCM_DATA`, which matters for the one-shot AssistNow (MGA) burst billed at NTRIP connect. Only then does it open an NTRIP connection to the PointPerfect caster (`ppntrip.services.u-blox.com`, TLS on port `2102` or plain TCP on `2101`), authenticate with the per-Thing username/password, and request the mountpoint for the configured correction format.
 
-The caster provides *localized* corrections, so the client periodically reports the vehicle's position to it. The [GPS_RAW_INT](https://mavlink.io/en/messages/common.html#GPS_RAW_INT) MAVLink messages from the flight controller are converted to an NMEA-GGA sentence and sent to the caster every 10 seconds.
+The caster provides *localized* corrections, so the client periodically reports the vehicle's position to it. After a continuous ≥2D fix for a few seconds, GPS_RAW_INT is converted to an NMEA-GGA sentence and sent to the caster every 10 seconds. MGA forwarding itself is not gated on fix — only on the receiver being up.
 
 The incoming correction stream is forwarded, unmodified, to the flight controller as [GPS_RTCM_DATA](https://mavlink.io/en/messages/common.html#GPS_RTCM_DATA) MAVLink messages (fragmented when larger than the message payload). The autopilot injects these bytes directly into the u-blox receiver to compute a high-precision fix.
 

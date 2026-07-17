@@ -60,6 +60,9 @@ private:
 	static constexpr std::chrono::seconds kScannerIdleFlush{2};
 
 	bool wait_for_mavsdk_connection(double timeout_s);
+	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
+	// driver is up and inject is safe. Returns false if exit was requested.
+	bool wait_for_gps_receiver();
 	void handle_gps_raw_int(const mavlink_message_t& message);
 
 	// NTRIP transport
@@ -105,6 +108,11 @@ private:
 
 	// Tracks continuous >=2D fix so we only report position after a stable window.
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
+
+	// Set on the first GPS_RAW_INT of any fix_type. Used to delay NTRIP connect
+	// (and therefore the one-shot MGA burst) until the receiver is configured
+	// enough that the autopilot will inject GPS_RTCM_DATA to the device.
+	std::atomic<bool> _gps_receiver_seen{false};
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;
