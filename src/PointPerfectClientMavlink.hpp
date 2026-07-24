@@ -10,6 +10,8 @@
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
 
+#include "UbxFrameScanner.hpp"
+
 // Forward declarations to keep OpenSSL out of the header
 typedef struct ssl_st SSL;
 typedef struct ssl_ctx_st SSL_CTX;
@@ -30,6 +32,9 @@ public:
 		std::string ntrip_password;
 		bool use_tls;
 		bool send_gga;
+		// Request AssistNow (MGA) startup assistance for faster TTFF by using
+		// the *-MGA mountpoints. u-blox receivers only.
+		bool use_mga;
 	};
 
 	PointPerfectClientMavlink(const Settings& settings);
@@ -43,7 +48,21 @@ private:
 	static constexpr uint8_t kMinFixType = 2;
 	static constexpr std::chrono::seconds kStableFixDuration{3};
 
+	// GPS_RTCM_DATA carries at most 4 fragments of 180 bytes per sequence.
+	static constexpr size_t kMaxSequenceLength = 4 * MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN;
+
+	// Pacing for the connect-time UBX-MGA burst (several KB at once): PX4
+	// drains gps_inject_data from an 8-deep queue, so an unpaced burst drops
+	// chunks before they reach the receiver.
+	static constexpr std::chrono::milliseconds kMgaMessageInterval{20};
+
+	// A partial frame candidate is flushed as raw data if the stream idles.
+	static constexpr std::chrono::seconds kScannerIdleFlush{2};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
+	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
+	// driver is up and inject is safe. Returns false if exit was requested.
+	bool wait_for_gps_receiver();
 	void handle_gps_raw_int(const mavlink_message_t& message);
 
 	// NTRIP transport
@@ -60,6 +79,9 @@ private:
 
 	// Corrections forwarding
 	void forward_corrections(const uint8_t* data, size_t length);
+	void forward_ubx(const uint8_t* frame, size_t length);
+	void forward_raw(const uint8_t* data, size_t length);
+	void send_sequence(const uint8_t* data, size_t length); // length <= kMaxSequenceLength
 	void send_mavlink_gps_rtcm_data(const mavlink_gps_rtcm_data_t& msg);
 
 	// MAVSDK
@@ -86,6 +108,16 @@ private:
 
 	// Tracks continuous >=2D fix so we only report position after a stable window.
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
+
+	// Set on the first GPS_RAW_INT of any fix_type. Used to delay NTRIP connect
+	// (and therefore the one-shot MGA burst) until the receiver is configured
+	// enough that the autopilot will inject GPS_RTCM_DATA to the device.
+	std::atomic<bool> _gps_receiver_seen{false};
+
+	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
+	UbxFrameScanner _scanner;
+	std::chrono::steady_clock::time_point _last_stream_data{};
+	unsigned _mga_messages_forwarded = 0;
 
 	Settings _settings;
 	std::string _mountpoint; // resolved from settings (explicit or format-derived)
