@@ -72,11 +72,19 @@ private:
 	// log one attempt per minute rather than each one.
 	static constexpr unsigned kConnectFailureLogEvery = 12;
 
+	// The receiver is gone once GPS_RAW_INT stops for this long. PX4 publishes
+	// only on a parsed report, so the stream stops outright when the receiver
+	// drops or the driver goes back to configuring it — that is distinct from a
+	// receiver that is up and reporting fix_type 0.
+	static constexpr std::chrono::seconds kGpsReceiverTimeout{3};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
 	// driver is up and inject is safe. Returns false if exit was requested.
 	bool wait_for_gps_receiver();
 	void handle_gps_raw_int(const mavlink_message_t& message);
+	// True while GPS_RAW_INT has arrived within kGpsReceiverTimeout.
+	bool gps_receiver_up() const;
 
 	// NTRIP transport
 	bool ntrip_connect();
@@ -133,10 +141,12 @@ private:
 	// of this flag are logged; the rest is verbose-only.
 	bool _fix_reported = false;
 
-	// Set on the first GPS_RAW_INT of any fix_type. Used to delay NTRIP connect
-	// (and therefore the one-shot MGA burst) until the receiver is configured
-	// enough that the autopilot will inject GPS_RTCM_DATA to the device.
-	std::atomic<bool> _gps_receiver_seen{false};
+	// steady_clock ticks at the last GPS_RAW_INT of any fix_type, 0 before the
+	// first one. Written from the MAVSDK callback thread, read by run(). Whether
+	// it is recent is the whole receiver-presence signal: NTRIP stays closed
+	// until the driver is publishing, so the one-shot MGA burst is not injected
+	// while the autopilot is still configuring the receiver and dropping it.
+	std::atomic<int64_t> _last_gps_raw_int{0};
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;

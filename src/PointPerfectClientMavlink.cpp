@@ -114,16 +114,18 @@ void PointPerfectClientMavlink::run()
 		handle_gps_raw_int(message);
 	});
 
-	// Do not open the caster until the GPS driver is publishing. On MGA
-	// mountpoints the assistance burst is one-shot at connect (and billed);
-	// if inject is still blocked mid-receiver-config those bytes are dropped.
-	if (!wait_for_gps_receiver()) {
-		return;
-	}
-
 	uint8_t buffer[4096];
 
 	while (!_should_exit) {
+
+		// Do not open the caster until the GPS driver is publishing. On MGA
+		// mountpoints the assistance burst is one-shot at connect (and billed);
+		// if inject is still blocked mid-receiver-config those bytes are dropped.
+		// A receiver that comes back has lost what was injected before, so the
+		// reconnect is also how it gets a fresh assistance burst.
+		if (!wait_for_gps_receiver()) {
+			return;
+		}
 
 		_report_connect_failure = _settings.verbose || (_connect_failures % kConnectFailureLogEvery == 0);
 
@@ -166,6 +168,15 @@ void PointPerfectClientMavlink::run()
 			if (now - _last_stats_log >= kStatsInterval) {
 				log_stats();
 				_last_stats_log = now;
+			}
+
+			// Nothing injected while the receiver is away reaches it — PX4 drops
+			// inject data until the driver has it configured again. Drop the
+			// session instead of paying for a stream that goes nowhere.
+			if (!gps_receiver_up()) {
+				std::cout << "GPS receiver lost (no GPS_RAW_INT for " << kGpsReceiverTimeout.count()
+					  << "s), closing the NTRIP connection" << std::endl;
+				break;
 			}
 
 			int n = socket_recv(buffer, sizeof(buffer));
@@ -224,13 +235,13 @@ bool PointPerfectClientMavlink::wait_for_mavsdk_connection(double timeout_s)
 
 bool PointPerfectClientMavlink::wait_for_gps_receiver()
 {
-	if (_gps_receiver_seen.load()) {
+	if (gps_receiver_up()) {
 		return true;
 	}
 
 	std::cout << "Waiting for GPS_RAW_INT (receiver up) before NTRIP connect..." << std::endl;
 
-	while (!_should_exit && !_gps_receiver_seen.load()) {
+	while (!_should_exit && !gps_receiver_up()) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
 
@@ -240,6 +251,17 @@ bool PointPerfectClientMavlink::wait_for_gps_receiver()
 
 	std::cout << "GPS receiver seen; safe to open NTRIP (MGA can be injected)" << std::endl;
 	return true;
+}
+
+bool PointPerfectClientMavlink::gps_receiver_up() const
+{
+	const std::chrono::steady_clock::duration last{_last_gps_raw_int.load()};
+
+	if (last.count() == 0) {
+		return false; // nothing seen yet
+	}
+
+	return std::chrono::steady_clock::now() - std::chrono::steady_clock::time_point(last) < kGpsReceiverTimeout;
 }
 
 bool PointPerfectClientMavlink::ntrip_connect()
@@ -477,14 +499,26 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
 
-	// Any GPS_RAW_INT means the GPS driver is alive (even fix_type 0/1). Set
-	// once so wait_for_gps_receiver() can release; do not require a fix.
-	_gps_receiver_seen.store(true);
+	const auto now = std::chrono::steady_clock::now();
+	const std::chrono::steady_clock::duration previous{_last_gps_raw_int.exchange(now.time_since_epoch().count())};
+
+	// A gap in the stream means the receiver dropped out or the driver went back
+	// to configuring it. Either way it starts over with no ephemeris and no fix,
+	// so the fix state here starts over too.
+	if (previous.count() != 0 && now - std::chrono::steady_clock::time_point(previous) >= kGpsReceiverTimeout) {
+		const auto gap = std::chrono::duration_cast<std::chrono::seconds>(now - std::chrono::steady_clock::time_point(
+					 previous));
+		std::cout << "GPS receiver back (GPS_RAW_INT resumed after " << gap.count() << "s)" << std::endl;
+
+		_fix_ok_since.reset();
+		_fix_reported = false;
+
+		std::lock_guard<std::mutex> lock(_position.lock);
+		_position.valid = false;
+	}
 
 	// Require a continuous >=2D fix for kStableFixDuration before reporting
 	// position to the NTRIP caster. Any drop below 2D resets the window.
-	const auto now = std::chrono::steady_clock::now();
-
 	if (msg.fix_type < kMinFixType) {
 		if (_fix_reported) {
 			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type) << ")" << std::endl;
