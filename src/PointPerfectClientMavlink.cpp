@@ -174,7 +174,7 @@ void PointPerfectClientMavlink::run()
 			// inject data until the driver has it configured again. Drop the
 			// session instead of paying for a stream that goes nowhere.
 			if (!gps_receiver_up()) {
-				std::cout << "GPS receiver lost (no GPS_RAW_INT for " << kGpsReceiverTimeout.count()
+				std::cout << "GPS receiver lost (no GPS data for " << kGpsReceiverTimeout.count()
 					  << "s), closing the NTRIP connection" << std::endl;
 				break;
 			}
@@ -498,6 +498,16 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 {
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
+
+	// With no GPS at all the autopilot does not go quiet: PX4's GPS_RAW_INT
+	// stream keeps sending a synthetic report every second, zero-initialised
+	// with sentinel accuracies. It carries no receiver, so it does not count as
+	// one being there - leave the liveness timestamp alone and let the watchdog
+	// run out.
+	if (msg.fix_type == GPS_FIX_TYPE_NO_GPS && msg.satellites_visible == UINT8_MAX
+	    && msg.eph == UINT16_MAX && msg.time_usec == 0) {
+		return;
+	}
 
 	const auto now = std::chrono::steady_clock::now();
 	const std::chrono::steady_clock::duration previous{_last_gps_raw_int.exchange(now.time_since_epoch().count())};
