@@ -686,6 +686,13 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 	_stats.rx_bytes += length;
 	_last_stream_data = std::chrono::steady_clock::now();
 
+	// PX4 drops inject data until its GPS driver has the receiver configured,
+	// so nothing sent now would reach it. run() closes the session on its next
+	// tick; until then these bytes go nowhere.
+	if (!gps_receiver_up()) {
+		return;
+	}
+
 	if (!_mga_expected) {
 		forward_raw(data, length); // no assistance in this stream to separate out
 		return;
@@ -715,6 +722,13 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 	size_t offset = 0;
 
 	for (size_t frame_length : _mga_frame_lengths) {
+		// Pacing spreads the burst over seconds, long enough for the receiver to
+		// leave partway through. Stop rather than pace the remainder into a
+		// driver that is dropping it; the reconnect brings a fresh burst.
+		if (!gps_receiver_up()) {
+			return;
+		}
+
 		forward_ubx(&_mga_staging[offset], frame_length);
 		offset += frame_length;
 	}
