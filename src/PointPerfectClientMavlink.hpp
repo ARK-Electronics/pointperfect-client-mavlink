@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <iosfwd>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -35,6 +36,9 @@ public:
 		// Request AssistNow (MGA) startup assistance for faster TTFF by using
 		// the *-MGA mountpoints. u-blox receivers only.
 		bool use_mga;
+		// Log every correction chunk and every forwarded message instead of a
+		// periodic throughput summary.
+		bool verbose;
 	};
 
 	PointPerfectClientMavlink(const Settings& settings);
@@ -58,6 +62,14 @@ private:
 
 	// A partial frame candidate is flushed as raw data if the stream idles.
 	static constexpr std::chrono::seconds kScannerIdleFlush{2};
+
+	// How often the throughput summary is logged while streaming. It doubles as
+	// a liveness signal, so it is logged even when nothing arrived.
+	static constexpr std::chrono::seconds kStatsInterval{30};
+
+	// Connect failures repeat every 5s (no network at boot, bad credentials);
+	// log one attempt per minute rather than each one.
+	static constexpr unsigned kConnectFailureLogEvery = 12;
 
 	bool wait_for_mavsdk_connection(double timeout_s);
 	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
@@ -84,12 +96,19 @@ private:
 	void send_sequence(const uint8_t* data, size_t length); // length <= kMaxSequenceLength
 	void send_mavlink_gps_rtcm_data(const mavlink_gps_rtcm_data_t& msg);
 
+	// Logging
+	void log_stats();         // periodic throughput summary, resets the counters
+	void report_mga_burst();  // one-shot, once the assistance burst is over
+	std::ostream& connect_log(); // stderr, or discarded while a retry is throttled
+
 	// MAVSDK
 	std::shared_ptr<mavsdk::Mavsdk> _mavsdk;
 	std::shared_ptr<mavsdk::MavlinkPassthrough> _mavlink_passthrough;
 	uint8_t _sequence_id = 0;
 
 	// NTRIP socket / TLS
+	unsigned _connect_failures = 0; // consecutive; reset once a stream is up
+	bool _report_connect_failure = true; // this attempt's turn to be logged
 	int _socket_fd = -1;
 	SSL* _ssl = nullptr;
 	SSL_CTX* _ssl_ctx = nullptr;
@@ -108,6 +127,10 @@ private:
 
 	// Tracks continuous >=2D fix so we only report position after a stable window.
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
+	// True once the stable window elapsed and the position is being reported.
+	// Fix acquisition flaps until the receiver settles, so only the transitions
+	// of this flag are logged; the rest is verbose-only.
+	bool _fix_reported = false;
 
 	// Set on the first GPS_RAW_INT of any fix_type. Used to delay NTRIP connect
 	// (and therefore the one-shot MGA burst) until the receiver is configured
@@ -118,6 +141,15 @@ private:
 	UbxFrameScanner _scanner;
 	std::chrono::steady_clock::time_point _last_stream_data{};
 	unsigned _mga_messages_forwarded = 0;
+	size_t _mga_bytes_forwarded = 0;
+	bool _mga_burst_reported = false;
+
+	// Throughput since the last summary. Only touched from the run() thread.
+	struct Stats {
+		size_t rx_bytes;
+		unsigned tx_messages;
+	} _stats = {};
+	std::chrono::steady_clock::time_point _last_stats_log{};
 
 	Settings _settings;
 	std::string _mountpoint; // resolved from settings (explicit or format-derived)

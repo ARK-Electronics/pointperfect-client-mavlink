@@ -74,11 +74,6 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 
 	std::cout << "Correction format: " << (use_spartn ? "SPARTN" : "RTCM") << std::endl;
 
-	if (use_spartn) {
-		std::cout << "WARNING: PX4 currently only injects/parses RTCM. SPARTN requires "
-			  << "receiver/firmware support for GPS_RTCM_DATA-carried SPARTN." << std::endl;
-	}
-
 	if (_settings.use_mga) {
 		std::cout << "MGA assistance data enabled (u-blox receivers only)" << std::endl;
 
@@ -127,8 +122,15 @@ void PointPerfectClientMavlink::run()
 
 	while (!_should_exit) {
 
+		_report_connect_failure = _settings.verbose || (_connect_failures % kConnectFailureLogEvery == 0);
+
 		if (!ntrip_connect()) {
-			std::cerr << "NTRIP connect failed, retrying in 5s" << std::endl;
+			_connect_failures++;
+
+			if (_report_connect_failure) {
+				std::cerr << "NTRIP connect failed (attempt " << _connect_failures
+					  << "), retrying in 5s" << std::endl;
+			}
 
 			for (int i = 0; i < 5 && !_should_exit; i++) {
 				std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -137,11 +139,17 @@ void PointPerfectClientMavlink::run()
 			continue;
 		}
 
+		_connect_failures = 0;
+
 		// Report position immediately: the caster only starts (and keeps)
 		// streaming corrections once it has a GGA from this connection.
 		auto last_gga = std::chrono::steady_clock::now() - std::chrono::seconds(10);
 		_last_stream_data = std::chrono::steady_clock::now();
+		_last_stats_log = _last_stream_data;
 		_mga_messages_forwarded = 0;
+		_mga_bytes_forwarded = 0;
+		_mga_burst_reported = false;
+		_stats = {};
 
 		// Stream corrections until the connection drops or we're asked to exit.
 		while (!_should_exit) {
@@ -150,6 +158,11 @@ void PointPerfectClientMavlink::run()
 			if (_settings.send_gga && now - last_gga >= std::chrono::seconds(10)) {
 				send_gga();
 				last_gga = now;
+			}
+
+			if (now - _last_stats_log >= kStatsInterval) {
+				log_stats();
+				_last_stats_log = now;
 			}
 
 			int n = socket_recv(buffer, sizeof(buffer));
@@ -161,11 +174,21 @@ void PointPerfectClientMavlink::run()
 				std::cerr << "NTRIP connection lost" << std::endl;
 				break;
 
-			} else if (_scanner.buffered() > 0 && now - _last_stream_data >= kScannerIdleFlush) {
+			} else if (now - _last_stream_data >= kScannerIdleFlush) {
 				// Idle: a partial frame candidate is not going to complete.
-				_scanner.flush([this](const uint8_t* data, size_t length) { forward_raw(data, length); });
+				if (_scanner.buffered() > 0) {
+					_scanner.flush([this](const uint8_t* data, size_t length) { forward_raw(data, length); });
+				}
+
+				// The caster holds the corrections back until it has a GGA, so
+				// the burst is usually followed by silence, not by the raw bytes
+				// that would otherwise mark its end.
+				report_mga_burst();
 			}
 		}
+
+		// A burst cut short by the drop is still worth reporting.
+		report_mga_burst();
 
 		// Buffered partial data belongs to the old stream; drop it.
 		_scanner.reset();
@@ -218,8 +241,10 @@ bool PointPerfectClientMavlink::wait_for_gps_receiver()
 
 bool PointPerfectClientMavlink::ntrip_connect()
 {
-	std::cout << "Connecting to NTRIP caster: " << _settings.ntrip_host << ":" << _settings.ntrip_port
-		  << "/" << _mountpoint << std::endl;
+	if (_report_connect_failure) {
+		std::cout << "Connecting to NTRIP caster: " << _settings.ntrip_host << ":" << _settings.ntrip_port
+			  << "/" << _mountpoint << std::endl;
+	}
 
 	// Resolve and connect the TCP socket
 	struct addrinfo hints = {};
@@ -230,7 +255,7 @@ bool PointPerfectClientMavlink::ntrip_connect()
 	const std::string port_str = std::to_string(_settings.ntrip_port);
 
 	if (getaddrinfo(_settings.ntrip_host.c_str(), port_str.c_str(), &hints, &result) != 0) {
-		std::cerr << "Failed to resolve " << _settings.ntrip_host << std::endl;
+		connect_log() << "Failed to resolve " << _settings.ntrip_host << std::endl;
 		return false;
 	}
 
@@ -252,7 +277,7 @@ bool PointPerfectClientMavlink::ntrip_connect()
 	freeaddrinfo(result);
 
 	if (_socket_fd < 0) {
-		std::cerr << "Failed to connect to caster" << std::endl;
+		connect_log() << "Failed to connect to caster" << std::endl;
 		return false;
 	}
 
@@ -261,7 +286,7 @@ bool PointPerfectClientMavlink::ntrip_connect()
 		_ssl_ctx = SSL_CTX_new(TLS_client_method());
 
 		if (!_ssl_ctx) {
-			std::cerr << "Failed to create SSL context" << std::endl;
+			connect_log() << "Failed to create SSL context" << std::endl;
 			ntrip_disconnect();
 			return false;
 		}
@@ -272,8 +297,12 @@ bool PointPerfectClientMavlink::ntrip_connect()
 		SSL_set_tlsext_host_name(_ssl, _settings.ntrip_host.c_str()); // SNI
 
 		if (SSL_connect(_ssl) != 1) {
-			std::cerr << "TLS handshake failed" << std::endl;
-			ERR_print_errors_fp(stderr);
+			connect_log() << "TLS handshake failed" << std::endl;
+
+			if (_report_connect_failure) {
+				ERR_print_errors_fp(stderr);
+			}
+
 			ntrip_disconnect();
 			return false;
 		}
@@ -291,7 +320,7 @@ bool PointPerfectClientMavlink::ntrip_connect()
 		"\r\n";
 
 	if (socket_send(request.data(), request.size()) <= 0) {
-		std::cerr << "Failed to send NTRIP request" << std::endl;
+		connect_log() << "Failed to send NTRIP request" << std::endl;
 		ntrip_disconnect();
 		return false;
 	}
@@ -324,7 +353,7 @@ bool PointPerfectClientMavlink::read_ntrip_response(std::string& leftover)
 		int n = socket_recv(buffer, sizeof(buffer));
 
 		if (n < 0) {
-			std::cerr << "Connection closed while reading NTRIP response" << std::endl;
+			connect_log() << "Connection closed while reading NTRIP response" << std::endl;
 			return false;
 		}
 
@@ -344,7 +373,7 @@ bool PointPerfectClientMavlink::read_ntrip_response(std::string& leftover)
 
 	// NTRIP v2 responds with "HTTP/1.1 200", v1 with "ICY 200 OK".
 	if (header.find("200") == std::string::npos) {
-		std::cerr << "NTRIP caster rejected the request:\n" << header << std::endl;
+		connect_log() << "NTRIP caster rejected the request:\n" << header << std::endl;
 		return false;
 	}
 
@@ -454,12 +483,16 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	const auto now = std::chrono::steady_clock::now();
 
 	if (msg.fix_type < kMinFixType) {
-		if (_fix_ok_since.has_value()) {
-			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type)
+		if (_fix_reported) {
+			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type) << ")" << std::endl;
+
+		} else if (_settings.verbose && _fix_ok_since.has_value()) {
+			std::cout << "GPS fix dropped before stable (fix_type=" << int(msg.fix_type)
 				  << "), resetting stable-fix timer" << std::endl;
 		}
 
 		_fix_ok_since.reset();
+		_fix_reported = false;
 
 		std::lock_guard<std::mutex> lock(_position.lock);
 		_position.valid = false;
@@ -468,14 +501,24 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 
 	if (!_fix_ok_since.has_value()) {
 		_fix_ok_since = now;
-		std::cout << "GPS >=2D fix acquired (fix_type=" << int(msg.fix_type)
-			  << "), waiting " << kStableFixDuration.count()
-			  << "s for stability" << std::endl;
+
+		if (_settings.verbose) {
+			std::cout << "GPS >=2D fix acquired (fix_type=" << int(msg.fix_type)
+				  << "), waiting " << kStableFixDuration.count()
+				  << "s for stability" << std::endl;
+		}
+
 		return;
 	}
 
 	if (now - *_fix_ok_since < kStableFixDuration) {
 		return;
+	}
+
+	if (!_fix_reported) {
+		_fix_reported = true;
+		std::cout << "GPS fix stable (fix_type=" << int(msg.fix_type)
+			  << "), reporting position to the caster" << std::endl;
 	}
 
 	std::lock_guard<std::mutex> lock(_position.lock);
@@ -599,8 +642,11 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 		return;
 	}
 
-	std::cout << "\nReceived " << length << " correction bytes" << std::endl;
+	if (_settings.verbose) {
+		std::cout << "\nReceived " << length << " correction bytes" << std::endl;
+	}
 
+	_stats.rx_bytes += length;
 	_last_stream_data = std::chrono::steady_clock::now();
 
 	// UBX-MGA assistance (MGA mountpoints) is forwarded message-aligned and
@@ -615,11 +661,14 @@ void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)
 	// The autopilot writes GPS_RTCM_DATA payloads to the receiver as-is, so
 	// UBX-MGA reaches the receiver on the same path as the corrections.
 	_mga_messages_forwarded++;
+	_mga_bytes_forwarded += length;
 
-	char msg_id[16];
-	snprintf(msg_id, sizeof(msg_id), "UBX-%02X-%02X", frame[2], frame[3]);
-	std::cout << "Forwarding MGA message " << _mga_messages_forwarded
-		  << " (" << msg_id << ", " << length << " bytes)" << std::endl;
+	if (_settings.verbose) {
+		char msg_id[16];
+		snprintf(msg_id, sizeof(msg_id), "UBX-%02X-%02X", frame[2], frame[3]);
+		std::cout << "Forwarding MGA message " << _mga_messages_forwarded
+			  << " (" << msg_id << ", " << length << " bytes)" << std::endl;
+	}
 
 	send_sequence(frame, length);
 
@@ -630,6 +679,10 @@ void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)
 
 void PointPerfectClientMavlink::forward_raw(const uint8_t* data, size_t length)
 {
+	// The assistance burst is one-shot at connect, ahead of the corrections:
+	// the first correction bytes mark its end.
+	report_mga_burst();
+
 	size_t offset = 0;
 
 	while (offset < length) {
@@ -685,7 +738,11 @@ void PointPerfectClientMavlink::send_sequence(const uint8_t* data, size_t length
 
 void PointPerfectClientMavlink::send_mavlink_gps_rtcm_data(const mavlink_gps_rtcm_data_t& msg)
 {
-	std::cout << "Sending GPS_RTCM_DATA: " << int(msg.len) << std::endl;
+	if (_settings.verbose) {
+		std::cout << "Sending GPS_RTCM_DATA: " << int(msg.len) << std::endl;
+	}
+
+	_stats.tx_messages++;
 	_mavlink_passthrough->queue_message([&](MavlinkAddress mavlink_address, uint8_t channel) {
 		mavlink_message_t message;
 
@@ -697,4 +754,33 @@ void PointPerfectClientMavlink::send_mavlink_gps_rtcm_data(const mavlink_gps_rtc
 			&msg);
 		return message;
 	});
+}
+
+void PointPerfectClientMavlink::log_stats()
+{
+	// Logged unconditionally: a window with no corrections means the caster
+	// went quiet, which is exactly what a stalled stream looks like.
+	std::cout << "Corrections: " << _stats.rx_bytes << " bytes received, "
+		  << _stats.tx_messages << " GPS_RTCM_DATA sent (last "
+		  << kStatsInterval.count() << "s)" << std::endl;
+
+	_stats = {};
+}
+
+std::ostream& PointPerfectClientMavlink::connect_log()
+{
+	// A stream with no buffer swallows everything written to it.
+	static std::ostream discarded(nullptr);
+	return _report_connect_failure ? std::cerr : discarded;
+}
+
+void PointPerfectClientMavlink::report_mga_burst()
+{
+	if (_mga_burst_reported || _mga_messages_forwarded == 0) {
+		return;
+	}
+
+	_mga_burst_reported = true;
+	std::cout << "MGA assistance: forwarded " << _mga_messages_forwarded << " messages ("
+		  << _mga_bytes_forwarded << " bytes)" << std::endl;
 }

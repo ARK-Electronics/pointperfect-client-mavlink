@@ -31,6 +31,18 @@ The caster provides *localized* corrections, so the client periodically reports 
 
 The incoming correction stream is forwarded, unmodified, to the flight controller as [GPS_RTCM_DATA](https://mavlink.io/en/messages/common.html#GPS_RTCM_DATA) MAVLink messages (fragmented when larger than the message payload). The autopilot injects these bytes directly into the u-blox receiver to compute a high-precision fix.
 
+### Logging
+Connection lifecycle, MGA burst completion, and stable-fix transitions are logged as they happen. The correction stream itself is summarized every 30 seconds rather than logged per message:
+```
+Corrections: 5106 bytes received, 39 GPS_RTCM_DATA sent (last 30s)
+```
+The summary is printed even when nothing arrived, so a stalled caster is visible. Fix transitions are logged when the position actually starts or stops being reported, not while acquisition flaps, and a connect that keeps failing (no network at boot, bad credentials) is logged once a minute instead of on every 5 s retry.
+
+For per-message logging (every correction chunk, every forwarded MGA message and `GPS_RTCM_DATA`, every retry, and fix acquisition before the stable window):
+```toml
+verbose = true
+```
+
 ### Credentials
 From the Thingstream portal, open your PointPerfect *Thing* → **Credentials**. Copy the NTRIP server, port, username, and password into the config:
 ```toml
