@@ -72,9 +72,12 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 		}
 	}
 
+	// An explicitly configured *-MGA mountpoint carries assistance too.
+	_mga_expected = _mountpoint.ends_with("-MGA");
+
 	std::cout << "Correction format: " << (use_spartn ? "SPARTN" : "RTCM") << std::endl;
 
-	if (_settings.use_mga) {
+	if (_mga_expected) {
 		std::cout << "MGA assistance data enabled (u-blox receivers only)" << std::endl;
 
 		if (!_settings.send_gga) {
@@ -649,11 +652,42 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 	_stats.rx_bytes += length;
 	_last_stream_data = std::chrono::steady_clock::now();
 
+	if (!_mga_expected) {
+		forward_raw(data, length); // no assistance in this stream to separate out
+		return;
+	}
+
+	// A read can hold the tail of the assistance burst and the first correction
+	// bytes. Stage them apart so each GPS_RTCM_DATA sequence carries one type
+	// and the receiver never gets a correction fragment wedged between two
+	// assistance messages.
+	_mga_staging.clear();
+	_mga_frame_lengths.clear();
+	_raw_staging.clear();
+
 	// UBX-MGA assistance (MGA mountpoints) is forwarded message-aligned and
 	// paced; everything else passes through unmodified.
 	_scanner.feed(data, length,
-	[this](const uint8_t* frame, size_t frame_length) { forward_ubx(frame, frame_length); },
-	[this](const uint8_t* raw, size_t raw_length) { forward_raw(raw, raw_length); });
+	[this](const uint8_t* frame, size_t frame_length) {
+		_mga_staging.insert(_mga_staging.end(), frame, frame + frame_length);
+		_mga_frame_lengths.push_back(frame_length);
+	},
+	[this](const uint8_t* raw, size_t raw_length) {
+		_raw_staging.insert(_raw_staging.end(), raw, raw + raw_length);
+	});
+
+	// Assistance goes first: it is one-shot, billed, and paced to survive the
+	// autopilot's injection queue, which unpaced correction bytes would crowd.
+	size_t offset = 0;
+
+	for (size_t frame_length : _mga_frame_lengths) {
+		forward_ubx(&_mga_staging[offset], frame_length);
+		offset += frame_length;
+	}
+
+	if (!_raw_staging.empty()) {
+		forward_raw(_raw_staging.data(), _raw_staging.size());
+	}
 }
 
 void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)

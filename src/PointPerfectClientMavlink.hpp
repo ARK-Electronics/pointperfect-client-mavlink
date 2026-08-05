@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <memory>
+#include <vector>
 
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
@@ -139,6 +140,12 @@ private:
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;
+	bool _mga_expected = false; // the resolved mountpoint carries assistance
+	// Per-read staging that keeps assistance and correction bytes in separate
+	// GPS_RTCM_DATA sequences. Reused so a read costs no allocation.
+	std::vector<uint8_t> _mga_staging;
+	std::vector<size_t> _mga_frame_lengths;
+	std::vector<uint8_t> _raw_staging;
 	std::chrono::steady_clock::time_point _last_stream_data{};
 	unsigned _mga_messages_forwarded = 0;
 	size_t _mga_bytes_forwarded = 0;

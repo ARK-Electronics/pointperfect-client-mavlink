@@ -18,6 +18,8 @@ use_mga = true    # u-blox receivers only
 ```
 The client extracts the UBX-MGA messages from the stream and forwards each one to the flight controller in its own `GPS_RTCM_DATA` sequence, paced 20 ms apart so the burst of assistance data (several KB at connect) does not overflow the autopilot's injection queue on its way to the receiver. `use_mga` requires `send_gga`, and selects the `-MGA` mountpoint automatically unless `ntrip_mountpoint` is set explicitly (an explicit `*-MGA` mountpoint gets the same forwarding treatment).
 
+The caster multiplexes assistance and corrections onto one stream, so a single read can hold both. The two are never injected interleaved: assistance and correction bytes from a read go out in separate `GPS_RTCM_DATA` sequences, assistance first, and correction bytes that arrived on either side of an assistance message are rejoined into one sequence. The receiver therefore never has a UBX frame wedged into the middle of an RTCM message. Only UBX class `0x13` (MGA) is pulled out of the stream; on a mountpoint without `-MGA` the stream is passed through untouched.
+
 You must first create a Thingstream account, activate a PointPerfect plan on a *Thing*, and copy the NTRIP credentials into the config file. <br>
 https://portal.thingstream.io/
 
