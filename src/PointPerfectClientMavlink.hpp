@@ -79,6 +79,11 @@ private:
 	// A stable fix lost this long means lost ephemeris; a flap recovers faster.
 	static constexpr std::chrono::seconds kFixLostReplayDelay{10};
 
+	// A NEAR caster drops a session whose GGA goes quiet (~60s observed). Keep
+	// reporting the last-known position through a fix outage — stream selection
+	// only needs a coarse position — so corrections survive a cold restart.
+	static constexpr std::chrono::minutes kGgaGracePeriod{5};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	// Blocks until GPS_RAW_INT arrives (driver up, inject safe); false on exit.
 	bool wait_for_gps_receiver();
@@ -134,6 +139,7 @@ private:
 		uint8_t satellites_visible;
 		uint16_t eph; // HDOP * 100; UINT16_MAX if unknown
 		bool valid;
+		bool stale; // fix lost; last-known position reported at SPS quality
 		std::mutex lock;
 	} _position = {};
 
@@ -141,6 +147,8 @@ private:
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
 	// Position is being reported; only transitions are logged (acquisition flaps).
 	bool _fix_reported = false;
+	// When the position went stale; grace expires kGgaGracePeriod later.
+	std::chrono::steady_clock::time_point _gga_stale_since{};
 
 	// steady_clock ticks at the last real GPS_RAW_INT, 0 before the first —
 	// the receiver-presence signal. Callback thread writes, run() reads.
