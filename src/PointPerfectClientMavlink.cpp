@@ -605,9 +605,6 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 		return;
 	}
 
-	// Any >=2D report disarms the ephemeris-loss timer.
-	_fix_lost_since = 0;
-
 	if (!_fix_ok_since.has_value()) {
 		_fix_ok_since = now;
 
@@ -623,6 +620,12 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	if (now - *_fix_ok_since < kStableFixDuration) {
 		return;
 	}
+
+	// Only a *stable* fix disarms the ephemeris-loss timer. A lone >=2D epoch
+	// during cold-start flapping used to disarm it — and since re-arming needs
+	// a reported (stable) fix at the moment of loss, one flap inside the 10s
+	// window silently cancelled the assistance replay for the whole outage.
+	_fix_lost_since = 0;
 
 	if (!_fix_reported) {
 		_fix_reported = true;
