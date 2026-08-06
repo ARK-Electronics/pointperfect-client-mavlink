@@ -569,6 +569,7 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 
 		std::lock_guard<std::mutex> lock(_position.lock);
 		_position.valid = false;
+		_position.stale = false;
 	}
 
 	if (msg.time_usec != 0) {
@@ -589,8 +590,18 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 		_fix_ok_since.reset();
 		_fix_reported = false;
 
+		// Keep the last-known position through the outage: the caster drops a
+		// session whose GGA goes quiet, and reconnecting costs the stream.
 		std::lock_guard<std::mutex> lock(_position.lock);
-		_position.valid = false;
+
+		if (_position.valid && !_position.stale) {
+			_position.stale = true;
+			_gga_stale_since = now;
+
+		} else if (_position.stale && now - _gga_stale_since >= kGgaGracePeriod) {
+			_position.valid = false;
+		}
+
 		return;
 	}
 
@@ -627,6 +638,7 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	_position.satellites_visible = msg.satellites_visible;
 	_position.eph = msg.eph;
 	_position.valid = true;
+	_position.stale = false;
 }
 
 uint8_t PointPerfectClientMavlink::nmea_quality_from_fix_type(uint8_t fix_type)
@@ -658,6 +670,7 @@ bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 	uint8_t fix_type;
 	uint8_t satellites_visible;
 	uint16_t eph;
+	bool stale;
 	{
 		std::lock_guard<std::mutex> lock(_position.lock);
 
@@ -671,9 +684,12 @@ bool PointPerfectClientMavlink::build_gga(std::string& sentence)
 		fix_type = _position.fix_type;
 		satellites_visible = _position.satellites_visible;
 		eph = _position.eph;
+		stale = _position.stale;
 	}
 
-	const uint8_t quality = nmea_quality_from_fix_type(fix_type);
+	// A stale position is still the right stream selector, but claim no more
+	// than a plain GPS fix for it.
+	const uint8_t quality = stale ? 1 : nmea_quality_from_fix_type(fix_type);
 
 	// satellites_visible is UINT8_MAX when unknown
 	const unsigned sats = (satellites_visible == UINT8_MAX) ? 0u
