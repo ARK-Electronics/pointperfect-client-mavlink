@@ -68,10 +68,6 @@ Install MAVSDK if you haven't already, the latest releases can be found at https
 ```
 sudo dpkg -i libmavsdk-dev_2.4.1_debian12_arm64.deb
 ```
-Initialize submodules (tomlplusplus)
-```
-git submodule update --init --recursive
-```
 Build
 ```
 make
