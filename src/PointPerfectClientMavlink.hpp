@@ -56,10 +56,15 @@ private:
 	// GPS_RTCM_DATA carries at most 4 fragments of 180 bytes per sequence.
 	static constexpr size_t kMaxSequenceLength = 4 * MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN;
 
-	// Pacing for the connect-time UBX-MGA burst (several KB at once): PX4
-	// drains gps_inject_data from an 8-deep queue, so an unpaced burst drops
-	// chunks before they reach the receiver.
-	static constexpr std::chrono::milliseconds kMgaMessageInterval{20};
+	// Pacing for the connect-time UBX-MGA burst (several KB at once). The
+	// autopilot buffers injected corrections in a uORB queue - 8 deep on PX4
+	// 1.16 and earlier (gps_inject_data), 16 since (rtcm_corrections) - and the
+	// GPS driver only drains it between receiver reads, which stalls entirely
+	// while the driver is configuring the receiver. Overflow is silent and
+	// costs the oldest message in the queue, which for this burst is the
+	// UBX-MGA-INI the rest of the assistance is useless without. 50ms keeps a
+	// 16-deep queue covered across an 800ms stall.
+	static constexpr std::chrono::milliseconds kMgaMessageInterval{50};
 
 	// A partial frame candidate is flushed as raw data if the stream idles.
 	static constexpr std::chrono::seconds kScannerIdleFlush{2};
