@@ -87,6 +87,11 @@ private:
 	// is refetched (billed) instead of replayed.
 	static constexpr std::chrono::hours kMgaCacheMaxAge{2};
 
+	// A stable fix that stays lost this long suggests the receiver lost its
+	// ephemeris, however that happened. A natural flap recovers faster, and a
+	// false positive only costs a replay from memory.
+	static constexpr std::chrono::seconds kFixLostReplayDelay{10};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
 	// driver is up and inject is safe. Returns false if exit was requested.
@@ -184,6 +189,10 @@ private:
 	// The receiver restarted and came back without ephemeris; serve it from the
 	// cache. Set from the MAVSDK callback thread, consumed by run().
 	std::atomic<bool> _mga_replay_pending{false};
+	// steady_clock ticks when a stable fix was lost, 0 while there is a fix (or
+	// none was stable yet). Armed by the callback thread; run() schedules a
+	// replay once the loss outlasts kFixLostReplayDelay.
+	std::atomic<int64_t> _fix_lost_since{0};
 	// GPS_RAW_INT carried a nonzero time_usec: the receiver knows UTC time. A
 	// report without time after this means the receiver restarted — it keeps
 	// time across a fix flap, and PX4's driver can reconfigure a reset receiver

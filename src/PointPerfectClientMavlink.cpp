@@ -186,6 +186,21 @@ void PointPerfectClientMavlink::run()
 				break;
 			}
 
+			// A stable fix lost for longer than a flap means the ephemeris is
+			// suspect, whatever the receiver went through — a driver-issued
+			// reset can be invisible here: the publication gap stays under the
+			// presence timeout and the receiver re-derives time from signals it
+			// still tracks before publishing resumes. Replaying is free.
+			const std::chrono::steady_clock::duration fix_lost{_fix_lost_since.load()};
+
+			if (fix_lost.count() != 0 && _mga_cache_complete && !_mga_replay_pending
+			    && now - std::chrono::steady_clock::time_point(fix_lost) >= kFixLostReplayDelay) {
+				std::cout << "GPS fix lost for " << kFixLostReplayDelay.count()
+					  << "s, scheduling an assistance replay" << std::endl;
+				_fix_lost_since = 0;
+				_mga_replay_pending = true;
+			}
+
 			// A receiver that restarted came back without ephemeris; serve it
 			// from the cache so the fetch stays one per client run. Checked in
 			// the loop, not only after connect: a restart the driver recovers
@@ -589,6 +604,9 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	if (msg.fix_type < kMinFixType) {
 		if (_fix_reported) {
 			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type) << ")" << std::endl;
+			// Arm the ephemeris-loss timer: if this loss outlasts a flap,
+			// run() schedules an assistance replay.
+			_fix_lost_since = now.time_since_epoch().count();
 
 		} else if (_settings.verbose && _fix_ok_since.has_value()) {
 			std::cout << "GPS fix dropped before stable (fix_type=" << int(msg.fix_type)
@@ -602,6 +620,9 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 		_position.valid = false;
 		return;
 	}
+
+	// Any >=2D report disarms the ephemeris-loss timer.
+	_fix_lost_since = 0;
 
 	if (!_fix_ok_since.has_value()) {
 		_fix_ok_since = now;
@@ -965,8 +986,10 @@ void PointPerfectClientMavlink::mark_mga_cache_complete()
 void PointPerfectClientMavlink::replay_mga_cache()
 {
 	// The replay reports here in both outcomes; keep the fetch-flavored
-	// "forwarded" report out of it.
+	// "forwarded" report out of it. The replay also answers any armed
+	// ephemeris-loss timer — one serving per loss.
 	_mga_burst_reported = true;
+	_fix_lost_since = 0;
 
 	size_t sent = 0;
 	size_t bytes = 0;
