@@ -60,14 +60,12 @@ PointPerfectClientMavlink::PointPerfectClientMavlink(const PointPerfectClientMav
 	const bool use_spartn = (_settings.correction_format == "spartn");
 
 	// An explicit mountpoint wins; otherwise derive it from the format. The
-	// *-MGA mountpoints prepend AssistNow ephemeris (UBX-MGA) for faster TTFF;
-	// they are only connected to while there is no cached burst to replay, so
-	// the corrections and assistance mountpoints are kept separately.
+	// assistance (-MGA) mountpoint is kept separately: it is only connected to
+	// while there is no cached burst to replay.
 	if (!_settings.ntrip_mountpoint.empty()) {
 		_mountpoint = _settings.ntrip_mountpoint;
 
-		// An explicitly configured *-MGA mountpoint carries assistance too; its
-		// plain sibling (the name minus "-MGA") serves the reconnects.
+		// An explicit *-MGA mountpoint's plain sibling serves the reconnects.
 		if (_mountpoint.ends_with("-MGA")) {
 			_mountpoint_mga = _mountpoint;
 			_mountpoint.resize(_mountpoint.size() - 4);
@@ -124,12 +122,8 @@ void PointPerfectClientMavlink::run()
 
 	while (!_should_exit) {
 
-		// Do not open the caster until the GPS driver is publishing. On MGA
-		// mountpoints the assistance burst is one-shot at connect (and billed);
-		// if inject is still blocked mid-receiver-config those bytes are dropped.
-		// A receiver that comes back has lost what was injected before, so the
-		// reconnect is also when it gets assistance again — replayed from the
-		// cache when there is one, fetched otherwise.
+		// Do not open the caster until the GPS driver is publishing: the burst
+		// is one-shot at connect and PX4 drops inject data mid-receiver-config.
 		if (!wait_for_gps_receiver()) {
 			return;
 		}
@@ -177,8 +171,7 @@ void PointPerfectClientMavlink::run()
 				_last_stats_log = now;
 			}
 
-			// Nothing injected while the receiver is away reaches it — PX4 drops
-			// inject data until the driver has it configured again. Drop the
+			// Nothing injected while the receiver is away reaches it; drop the
 			// session instead of paying for a stream that goes nowhere.
 			if (!gps_receiver_up()) {
 				std::cout << "GPS receiver lost (no GPS data for " << kGpsReceiverTimeout.count()
@@ -186,11 +179,8 @@ void PointPerfectClientMavlink::run()
 				break;
 			}
 
-			// A stable fix lost for longer than a flap means the ephemeris is
-			// suspect, whatever the receiver went through — a driver-issued
-			// reset can be invisible here: the publication gap stays under the
-			// presence timeout and the receiver re-derives time from signals it
-			// still tracks before publishing resumes. Replaying is free.
+			// A stable fix lost past a flap's length means lost ephemeris — the
+			// signal that survives a reset too fast for the other detectors.
 			const std::chrono::steady_clock::duration fix_lost{_fix_lost_since.load()};
 
 			if (fix_lost.count() != 0 && _mga_cache_complete && !_mga_replay_pending
@@ -201,11 +191,8 @@ void PointPerfectClientMavlink::run()
 				_mga_replay_pending = true;
 			}
 
-			// A receiver that restarted came back without ephemeris; serve it
-			// from the cache so the fetch stays one per client run. Checked in
-			// the loop, not only after connect: a restart the driver recovers
-			// quickly (a reset) never drops the connection, so there is no
-			// reconnect to hang the replay on.
+			// In the loop, not only after connect: a restart the driver
+			// recovers quickly never drops the connection.
 			if (_mga_cache_complete && _mga_replay_pending) {
 				replay_mga_cache();
 			}
@@ -225,9 +212,8 @@ void PointPerfectClientMavlink::run()
 					_scanner.flush([this](const uint8_t* data, size_t length) { forward_raw(data, length); });
 				}
 
-				// The caster holds the corrections back until it has a GGA, so
-				// the burst is usually followed by silence, not by the raw bytes
-				// that would otherwise mark its end.
+				// The caster withholds corrections until it has a GGA, so the
+				// burst usually ends in silence, not correction bytes.
 				mark_mga_cache_complete();
 				report_mga_burst();
 			}
@@ -298,9 +284,7 @@ bool PointPerfectClientMavlink::gps_receiver_up() const
 
 bool PointPerfectClientMavlink::ntrip_connect()
 {
-	// The assistance burst is billed per fetch: take the MGA mountpoint only
-	// while there is no complete cache to replay from, and refresh a cache
-	// whose ephemeris has aged out.
+	// Take the MGA mountpoint (billed) only while there is no cache to replay.
 	_fetching_assistance = false;
 
 	if (!_mountpoint_mga.empty()) {
@@ -551,11 +535,8 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	mavlink_gps_raw_int_t msg;
 	mavlink_msg_gps_raw_int_decode(&message, &msg);
 
-	// With no GPS at all the autopilot does not go quiet: PX4's GPS_RAW_INT
-	// stream keeps sending a synthetic report every second, zero-initialised
-	// with sentinel accuracies. It carries no receiver, so it does not count as
-	// one being there - leave the liveness timestamp alone and let the watchdog
-	// run out.
+	// With no GPS at all PX4 still sends a synthetic zeroed report every
+	// second; it carries no receiver, so let the watchdog run out.
 	if (msg.fix_type == GPS_FIX_TYPE_NO_GPS && msg.satellites_visible == UINT8_MAX
 	    && msg.eph == UINT16_MAX && msg.time_usec == 0) {
 		return;
@@ -564,13 +545,9 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	const auto now = std::chrono::steady_clock::now();
 	const std::chrono::steady_clock::duration previous{_last_gps_raw_int.exchange(now.time_since_epoch().count())};
 
-	// A restart shows up two ways. A gap in the stream: the receiver dropped out
-	// or the driver went back to configuring it. Or the receiver's UTC time
-	// going away: it keeps time across a fix flap, but a reset or power cycle
-	// clears it — and that is often the only signal, because the driver can have
-	// a reset receiver reconfigured and publishing again in under the
-	// receiver-presence timeout. Either way it came back with no ephemeris, no
-	// fix, and a replay of the cached assistance owed to it.
+	// A restart shows up as a stream gap, or as the receiver's UTC time going
+	// away (a flap keeps time) — often the only signal, since the driver can
+	// recover a reset receiver inside the presence timeout.
 	bool restarted = false;
 
 	if (previous.count() != 0 && now - std::chrono::steady_clock::time_point(previous) >= kGpsReceiverTimeout) {
@@ -585,7 +562,6 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	}
 
 	if (restarted) {
-		// Seen again once the restarted receiver re-learns time.
 		_gps_time_seen = false;
 		_mga_replay_pending = true;
 		_fix_ok_since.reset();
@@ -599,13 +575,10 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 		_gps_time_seen = true;
 	}
 
-	// Require a continuous >=2D fix for kStableFixDuration before reporting
-	// position to the NTRIP caster. Any drop below 2D resets the window.
+	// Report position only after a continuous >=2D fix; any drop resets the window.
 	if (msg.fix_type < kMinFixType) {
 		if (_fix_reported) {
 			std::cout << "GPS fix lost (fix_type=" << int(msg.fix_type) << ")" << std::endl;
-			// Arm the ephemeris-loss timer: if this loss outlasts a flap,
-			// run() schedules an assistance replay.
 			_fix_lost_since = now.time_since_epoch().count();
 
 		} else if (_settings.verbose && _fix_ok_since.has_value()) {
@@ -774,9 +747,8 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 	_stats.rx_bytes += length;
 	_last_stream_data = std::chrono::steady_clock::now();
 
-	// PX4 drops inject data until its GPS driver has the receiver configured,
-	// so nothing sent now would reach it. run() closes the session on its next
-	// tick; until then these bytes go nowhere.
+	// Nothing injected reaches an unconfigured receiver; run() closes the
+	// session on its next tick.
 	if (!gps_receiver_up()) {
 		return;
 	}
@@ -786,18 +758,14 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 		return;
 	}
 
-	// A read can hold the tail of the assistance burst and the first correction
-	// bytes. Stage them apart so each GPS_RTCM_DATA sequence carries one type
-	// and the receiver never gets a correction fragment wedged between two
-	// assistance messages.
+	// A read can hold the burst tail and the first correction bytes; stage them
+	// apart so a correction fragment is never wedged between assistance messages.
 	_mga_staging.clear();
 	_mga_frame_lengths.clear();
 	_raw_staging.clear();
 
-	// UBX-MGA assistance (MGA mountpoints) is forwarded message-aligned and
-	// paced; everything else passes through unmodified. Each frame is also
-	// cached as received, so the receiver's next restart is served from memory
-	// instead of another billed fetch.
+	// UBX-MGA goes out message-aligned, paced, and cached for replay;
+	// everything else passes through unmodified.
 	_scanner.feed(data, length,
 	[this](const uint8_t* frame, size_t frame_length) {
 		_mga_staging.insert(_mga_staging.end(), frame, frame + frame_length);
@@ -808,14 +776,12 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 		_raw_staging.insert(_raw_staging.end(), raw, raw + raw_length);
 	});
 
-	// Assistance goes first: it is one-shot, billed, and paced to survive the
-	// autopilot's injection queue, which unpaced correction bytes would crowd.
+	// Assistance first: unpaced correction bytes would crowd the queue.
 	size_t offset = 0;
 
 	for (size_t frame_length : _mga_frame_lengths) {
-		// Pacing spreads the burst over seconds, long enough for the receiver to
-		// leave partway through. Stop rather than pace the remainder into a
-		// driver that is dropping it; the reconnect brings a fresh burst.
+		// Pacing spans seconds — stop if the receiver leaves rather than pace
+		// the remainder into a driver that is dropping it.
 		if (!gps_receiver_up()) {
 			return;
 		}
@@ -831,8 +797,7 @@ void PointPerfectClientMavlink::forward_corrections(const uint8_t* data, size_t 
 
 void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)
 {
-	// The autopilot writes GPS_RTCM_DATA payloads to the receiver as-is, so
-	// UBX-MGA reaches the receiver on the same path as the corrections.
+	// GPS_RTCM_DATA payloads reach the receiver as-is, UBX included.
 	_mga_messages_forwarded++;
 	_mga_bytes_forwarded += length;
 
@@ -852,8 +817,7 @@ void PointPerfectClientMavlink::forward_ubx(const uint8_t* frame, size_t length)
 
 void PointPerfectClientMavlink::forward_raw(const uint8_t* data, size_t length)
 {
-	// The assistance burst is one-shot at connect, ahead of the corrections:
-	// the first correction bytes mark its end.
+	// The first correction bytes mark the end of the one-shot burst.
 	mark_mga_cache_complete();
 	report_mga_burst();
 
@@ -932,8 +896,7 @@ void PointPerfectClientMavlink::send_mavlink_gps_rtcm_data(const mavlink_gps_rtc
 
 void PointPerfectClientMavlink::log_stats()
 {
-	// Logged unconditionally: a window with no corrections means the caster
-	// went quiet, which is exactly what a stalled stream looks like.
+	// Logged even when empty: a silent window is what a stalled caster looks like.
 	std::cout << "Corrections: " << _stats.rx_bytes << " bytes received, "
 		  << _stats.tx_messages << " GPS_RTCM_DATA sent (last "
 		  << kStatsInterval.count() << "s)" << std::endl;
@@ -961,10 +924,8 @@ void PointPerfectClientMavlink::report_mga_burst()
 
 void PointPerfectClientMavlink::mark_mga_cache_complete()
 {
-	// Called when the stream moved past the burst (correction bytes arrived, or
-	// it went idle with the receiver up): everything the caster had to say was
-	// received, so the cache is whole. A live fetch also just served the
-	// receiver, which settles any replay it was owed.
+	// The stream moved past the burst, so the cache is whole; the live fetch
+	// also settled any replay the receiver was owed.
 	if (!_fetching_assistance || _mga_cache_complete || _mga_cache.empty()) {
 		return;
 	}
@@ -985,9 +946,7 @@ void PointPerfectClientMavlink::mark_mga_cache_complete()
 
 void PointPerfectClientMavlink::replay_mga_cache()
 {
-	// The replay reports here in both outcomes; keep the fetch-flavored
-	// "forwarded" report out of it. The replay also answers any armed
-	// ephemeris-loss timer — one serving per loss.
+	// Reports here in both outcomes, and answers any armed ephemeris-loss timer.
 	_mga_burst_reported = true;
 	_fix_lost_since = 0;
 
@@ -995,9 +954,7 @@ void PointPerfectClientMavlink::replay_mga_cache()
 	size_t bytes = 0;
 
 	for (const auto& message : _mga_cache) {
-		// Same bail as the live burst: pacing spreads this over seconds, long
-		// enough for the receiver to leave partway through. The replay stays
-		// pending, so the next connect tries again.
+		// Same bail as the live burst; the replay stays pending for the next try.
 		if (!gps_receiver_up()) {
 			std::cout << "MGA replay stopped (receiver away), will retry on reconnect" << std::endl;
 			return;

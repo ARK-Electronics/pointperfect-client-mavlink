@@ -56,48 +56,33 @@ private:
 	// GPS_RTCM_DATA carries at most 4 fragments of 180 bytes per sequence.
 	static constexpr size_t kMaxSequenceLength = 4 * MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN;
 
-	// Pacing for the connect-time UBX-MGA burst (several KB at once). The
-	// autopilot buffers injected corrections in a uORB queue - 8 deep on PX4
-	// 1.16 and earlier (gps_inject_data), 16 since (rtcm_corrections) - and the
-	// GPS driver only drains it between receiver reads, which stalls entirely
-	// while the driver is configuring the receiver. Overflow is silent and
-	// costs the oldest message in the queue, which for this burst is the
-	// UBX-MGA-INI the rest of the assistance is useless without. 50ms keeps a
-	// 16-deep queue covered across an 800ms stall.
+	// The autopilot's inject queue is 8-16 deep, drains only between receiver
+	// reads, and drops silently; 50ms covers a 16-deep queue across an 800ms stall.
 	static constexpr std::chrono::milliseconds kMgaMessageInterval{50};
 
 	// A partial frame candidate is flushed as raw data if the stream idles.
 	static constexpr std::chrono::seconds kScannerIdleFlush{2};
 
-	// How often the throughput summary is logged while streaming. It doubles as
-	// a liveness signal, so it is logged even when nothing arrived.
+	// Logged even when nothing arrived, so a stalled caster shows.
 	static constexpr std::chrono::seconds kStatsInterval{30};
 
-	// Connect failures repeat every 5s (no network at boot, bad credentials);
-	// log one attempt per minute rather than each one.
+	// Failed connects retry every 5s; log one per minute.
 	static constexpr unsigned kConnectFailureLogEvery = 12;
 
-	// The receiver is gone once GPS_RAW_INT stops for this long. PX4 publishes
-	// only on a parsed report, so the stream stops outright when the receiver
-	// drops or the driver goes back to configuring it — that is distinct from a
-	// receiver that is up and reporting fix_type 0.
+	// Receiver gone once GPS_RAW_INT stops this long (PX4 publishes only on a
+	// parsed report).
 	static constexpr std::chrono::seconds kGpsReceiverTimeout{3};
 
-	// AssistNow ephemeris is only valid for a few hours; a cache past this age
-	// is refetched (billed) instead of replayed.
+	// AssistNow ephemeris only lives a few hours; older caches are refetched.
 	static constexpr std::chrono::hours kMgaCacheMaxAge{2};
 
-	// A stable fix that stays lost this long suggests the receiver lost its
-	// ephemeris, however that happened. A natural flap recovers faster, and a
-	// false positive only costs a replay from memory.
+	// A stable fix lost this long means lost ephemeris; a flap recovers faster.
 	static constexpr std::chrono::seconds kFixLostReplayDelay{10};
 
 	bool wait_for_mavsdk_connection(double timeout_s);
-	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
-	// driver is up and inject is safe. Returns false if exit was requested.
+	// Blocks until GPS_RAW_INT arrives (driver up, inject safe); false on exit.
 	bool wait_for_gps_receiver();
 	void handle_gps_raw_int(const mavlink_message_t& message);
-	// True while GPS_RAW_INT has arrived within kGpsReceiverTimeout.
 	bool gps_receiver_up() const;
 
 	// NTRIP transport
@@ -124,10 +109,9 @@ private:
 	void report_mga_burst();  // one-shot, once the assistance burst is over
 	std::ostream& connect_log(); // stderr, or discarded while a retry is throttled
 
-	// MGA cache: the assistance burst is billed per fetch, so it is fetched once
-	// and receiver restarts are served from memory over the plain mountpoint.
-	void mark_mga_cache_complete(); // the stream moved past the burst: it is whole
-	void replay_mga_cache();        // paced replay; leaves the retry pending if cut short
+	// The burst is billed per fetch: fetch once, serve restarts from memory.
+	void mark_mga_cache_complete();
+	void replay_mga_cache(); // paced; leaves the retry pending if cut short
 
 	// MAVSDK
 	std::shared_ptr<mavsdk::Mavsdk> _mavsdk;
@@ -153,25 +137,19 @@ private:
 		std::mutex lock;
 	} _position = {};
 
-	// Tracks continuous >=2D fix so we only report position after a stable window.
+	// Continuous >=2D fix window gating the GGA report.
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
-	// True once the stable window elapsed and the position is being reported.
-	// Fix acquisition flaps until the receiver settles, so only the transitions
-	// of this flag are logged; the rest is verbose-only.
+	// Position is being reported; only transitions are logged (acquisition flaps).
 	bool _fix_reported = false;
 
-	// steady_clock ticks at the last GPS_RAW_INT of any fix_type, 0 before the
-	// first one. Written from the MAVSDK callback thread, read by run(). Whether
-	// it is recent is the whole receiver-presence signal: NTRIP stays closed
-	// until the driver is publishing, so the one-shot MGA burst is not injected
-	// while the autopilot is still configuring the receiver and dropping it.
+	// steady_clock ticks at the last real GPS_RAW_INT, 0 before the first —
+	// the receiver-presence signal. Callback thread writes, run() reads.
 	std::atomic<int64_t> _last_gps_raw_int{0};
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;
 	bool _fetching_assistance = false; // this connection is on the MGA mountpoint
-	// Per-read staging that keeps assistance and correction bytes in separate
-	// GPS_RTCM_DATA sequences. Reused so a read costs no allocation.
+	// Per-read staging keeping assistance and corrections in separate sequences.
 	std::vector<uint8_t> _mga_staging;
 	std::vector<size_t> _mga_frame_lengths;
 	std::vector<uint8_t> _raw_staging;
@@ -180,23 +158,18 @@ private:
 	size_t _mga_bytes_forwarded = 0;
 	bool _mga_burst_reported = false;
 
-	// The assistance burst, one complete UBX-MGA message per entry, as received
-	// from the fetch. Complete only once the stream moved past the burst — a
-	// fetch cut short (receiver away, connection drop) is refetched instead.
+	// The fetched burst, one UBX-MGA message per entry; complete only once the
+	// stream moved past it (a fetch cut short is refetched).
 	std::vector<std::vector<uint8_t>> _mga_cache;
 	bool _mga_cache_complete = false;
 	std::chrono::steady_clock::time_point _mga_cache_time{};
-	// The receiver restarted and came back without ephemeris; serve it from the
-	// cache. Set from the MAVSDK callback thread, consumed by run().
+	// Receiver restarted; it is owed a replay.
 	std::atomic<bool> _mga_replay_pending{false};
-	// steady_clock ticks when a stable fix was lost, 0 while there is a fix (or
-	// none was stable yet). Armed by the callback thread; run() schedules a
-	// replay once the loss outlasts kFixLostReplayDelay.
+	// When a stable fix was lost, 0 while fixed; outlasting kFixLostReplayDelay
+	// schedules a replay.
 	std::atomic<int64_t> _fix_lost_since{0};
-	// GPS_RAW_INT carried a nonzero time_usec: the receiver knows UTC time. A
-	// report without time after this means the receiver restarted — it keeps
-	// time across a fix flap, and PX4's driver can reconfigure a reset receiver
-	// faster than the publication-gap watchdog can notice.
+	// Receiver time seen; time going away again means it restarted (a flap
+	// keeps time).
 	bool _gps_time_seen = false;
 
 	// Throughput since the last summary. Only touched from the run() thread.
