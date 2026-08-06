@@ -163,12 +163,6 @@ void PointPerfectClientMavlink::run()
 		_mga_burst_reported = false;
 		_stats = {};
 
-		// A receiver that restarted came back without ephemeris; serve it from
-		// the cache so the fetch stays one per client run.
-		if (_mga_cache_complete && _mga_replay_pending) {
-			replay_mga_cache();
-		}
-
 		// Stream corrections until the connection drops or we're asked to exit.
 		while (!_should_exit) {
 			auto now = std::chrono::steady_clock::now();
@@ -190,6 +184,15 @@ void PointPerfectClientMavlink::run()
 				std::cout << "GPS receiver lost (no GPS data for " << kGpsReceiverTimeout.count()
 					  << "s), closing the NTRIP connection" << std::endl;
 				break;
+			}
+
+			// A receiver that restarted came back without ephemeris; serve it
+			// from the cache so the fetch stays one per client run. Checked in
+			// the loop, not only after connect: a restart the driver recovers
+			// quickly (a reset) never drops the connection, so there is no
+			// reconnect to hang the replay on.
+			if (_mga_cache_complete && _mga_replay_pending) {
+				replay_mga_cache();
 			}
 
 			int n = socket_recv(buffer, sizeof(buffer));
@@ -546,21 +549,39 @@ void PointPerfectClientMavlink::handle_gps_raw_int(const mavlink_message_t& mess
 	const auto now = std::chrono::steady_clock::now();
 	const std::chrono::steady_clock::duration previous{_last_gps_raw_int.exchange(now.time_since_epoch().count())};
 
-	// A gap in the stream means the receiver dropped out or the driver went back
-	// to configuring it. Either way it starts over with no ephemeris and no fix,
-	// so the fix state here starts over too, and the cached assistance burst is
-	// owed a replay.
+	// A restart shows up two ways. A gap in the stream: the receiver dropped out
+	// or the driver went back to configuring it. Or the receiver's UTC time
+	// going away: it keeps time across a fix flap, but a reset or power cycle
+	// clears it — and that is often the only signal, because the driver can have
+	// a reset receiver reconfigured and publishing again in under the
+	// receiver-presence timeout. Either way it came back with no ephemeris, no
+	// fix, and a replay of the cached assistance owed to it.
+	bool restarted = false;
+
 	if (previous.count() != 0 && now - std::chrono::steady_clock::time_point(previous) >= kGpsReceiverTimeout) {
 		const auto gap = std::chrono::duration_cast<std::chrono::seconds>(now - std::chrono::steady_clock::time_point(
 					 previous));
 		std::cout << "GPS receiver back (GPS_RAW_INT resumed after " << gap.count() << "s)" << std::endl;
+		restarted = true;
 
+	} else if (msg.time_usec == 0 && _gps_time_seen) {
+		std::cout << "GPS receiver restarted (receiver time lost)" << std::endl;
+		restarted = true;
+	}
+
+	if (restarted) {
+		// Seen again once the restarted receiver re-learns time.
+		_gps_time_seen = false;
 		_mga_replay_pending = true;
 		_fix_ok_since.reset();
 		_fix_reported = false;
 
 		std::lock_guard<std::mutex> lock(_position.lock);
 		_position.valid = false;
+	}
+
+	if (msg.time_usec != 0) {
+		_gps_time_seen = true;
 	}
 
 	// Require a continuous >=2D fix for kStableFixDuration before reporting

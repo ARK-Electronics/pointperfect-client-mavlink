@@ -181,9 +181,14 @@ private:
 	std::vector<std::vector<uint8_t>> _mga_cache;
 	bool _mga_cache_complete = false;
 	std::chrono::steady_clock::time_point _mga_cache_time{};
-	// The receiver went away and came back without ephemeris; serve it on the
-	// next connect. Set from the MAVSDK callback thread, consumed by run().
+	// The receiver restarted and came back without ephemeris; serve it from the
+	// cache. Set from the MAVSDK callback thread, consumed by run().
 	std::atomic<bool> _mga_replay_pending{false};
+	// GPS_RAW_INT carried a nonzero time_usec: the receiver knows UTC time. A
+	// report without time after this means the receiver restarted — it keeps
+	// time across a fix flap, and PX4's driver can reconfigure a reset receiver
+	// faster than the publication-gap watchdog can notice.
+	bool _gps_time_seen = false;
 
 	// Throughput since the last summary. Only touched from the run() thread.
 	struct Stats {
