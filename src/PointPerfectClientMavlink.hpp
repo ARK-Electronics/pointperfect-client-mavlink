@@ -83,6 +83,10 @@ private:
 	// receiver that is up and reporting fix_type 0.
 	static constexpr std::chrono::seconds kGpsReceiverTimeout{3};
 
+	// AssistNow ephemeris is only valid for a few hours; a cache past this age
+	// is refetched (billed) instead of replayed.
+	static constexpr std::chrono::hours kMgaCacheMaxAge{2};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
 	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
 	// driver is up and inject is safe. Returns false if exit was requested.
@@ -114,6 +118,11 @@ private:
 	void log_stats();         // periodic throughput summary, resets the counters
 	void report_mga_burst();  // one-shot, once the assistance burst is over
 	std::ostream& connect_log(); // stderr, or discarded while a retry is throttled
+
+	// MGA cache: the assistance burst is billed per fetch, so it is fetched once
+	// and receiver restarts are served from memory over the plain mountpoint.
+	void mark_mga_cache_complete(); // the stream moved past the burst: it is whole
+	void replay_mga_cache();        // paced replay; leaves the retry pending if cut short
 
 	// MAVSDK
 	std::shared_ptr<mavsdk::Mavsdk> _mavsdk;
@@ -155,7 +164,7 @@ private:
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;
-	bool _mga_expected = false; // the resolved mountpoint carries assistance
+	bool _fetching_assistance = false; // this connection is on the MGA mountpoint
 	// Per-read staging that keeps assistance and correction bytes in separate
 	// GPS_RTCM_DATA sequences. Reused so a read costs no allocation.
 	std::vector<uint8_t> _mga_staging;
@@ -166,6 +175,16 @@ private:
 	size_t _mga_bytes_forwarded = 0;
 	bool _mga_burst_reported = false;
 
+	// The assistance burst, one complete UBX-MGA message per entry, as received
+	// from the fetch. Complete only once the stream moved past the burst — a
+	// fetch cut short (receiver away, connection drop) is refetched instead.
+	std::vector<std::vector<uint8_t>> _mga_cache;
+	bool _mga_cache_complete = false;
+	std::chrono::steady_clock::time_point _mga_cache_time{};
+	// The receiver went away and came back without ephemeris; serve it on the
+	// next connect. Set from the MAVSDK callback thread, consumed by run().
+	std::atomic<bool> _mga_replay_pending{false};
+
 	// Throughput since the last summary. Only touched from the run() thread.
 	struct Stats {
 		size_t rx_bytes;
@@ -174,6 +193,7 @@ private:
 	std::chrono::steady_clock::time_point _last_stats_log{};
 
 	Settings _settings;
-	std::string _mountpoint; // resolved from settings (explicit or format-derived)
+	std::string _mountpoint;     // corrections mountpoint (explicit or format-derived)
+	std::string _mountpoint_mga; // assistance mountpoint; empty when MGA is off
 	std::atomic<bool> _should_exit = false;
 };
