@@ -16,7 +16,11 @@ For u-blox receivers, PointPerfect offers dedicated mountpoints (`NEAR-RTCM-MGA`
 ```toml
 use_mga = true    # u-blox receivers only
 ```
-The client extracts the UBX-MGA messages from the stream and forwards each one to the flight controller in its own `GPS_RTCM_DATA` sequence, paced 20 ms apart so the burst of assistance data (several KB at connect) does not overflow the autopilot's injection queue on its way to the receiver. `use_mga` requires `send_gga`, and selects the `-MGA` mountpoint automatically unless `ntrip_mountpoint` is set explicitly (an explicit `*-MGA` mountpoint gets the same forwarding treatment).
+The client extracts the UBX-MGA messages from the stream and forwards each one to the flight controller in its own `GPS_RTCM_DATA` sequence, paced so the burst of assistance data (several KB at connect) does not overflow the autopilot's injection queue on its way to the receiver. `use_mga` requires `send_gga`, and selects the `-MGA` mountpoint automatically unless `ntrip_mountpoint` is set explicitly (an explicit `*-MGA` mountpoint gets the same forwarding treatment, and its plain sibling — the name minus `-MGA` — serves the reconnects described next).
+
+The assistance burst is billed per fetch, so the client fetches it once and keeps it: every UBX-MGA message is cached in memory as it is received, and once the stream moves past the burst the cache is complete. From then on reconnects use the plain mountpoint, and a receiver that restarted (it comes back without ephemeris) gets the cached burst replayed from memory instead of a fresh fetch. A restart is recognized by a gap in GPS_RAW_INT, by the receiver's UTC time going away (a fix flap keeps time, a restart loses it), or by a stable fix staying lost past a flap's length — the last one is the catch-all, because PX4's driver can have a reset receiver reconfigured, re-timed from still-tracked signals, and publishing again before either of the first two can see anything. A false positive costs nothing: the replay comes from memory. The replay happens in place when the connection survived the restart, or at the next connect. A fetch cut short — receiver away or connection dropped mid-burst — is not marked complete and is refetched on the next connect. Because AssistNow ephemeris is only valid for a few hours, a cache older than 2 hours is refreshed with a new fetch rather than replayed.
+
+The caster multiplexes assistance and corrections onto one stream, so a single read can hold both. The two are never injected interleaved: assistance and correction bytes from a read go out in separate `GPS_RTCM_DATA` sequences, assistance first, and correction bytes that arrived on either side of an assistance message are rejoined into one sequence. The receiver therefore never has a UBX frame wedged into the middle of an RTCM message. Only UBX class `0x13` (MGA) is pulled out of the stream; on a mountpoint without `-MGA` the stream is passed through untouched.
 
 You must first create a Thingstream account, activate a PointPerfect plan on a *Thing*, and copy the NTRIP credentials into the config file. <br>
 https://portal.thingstream.io/
@@ -27,9 +31,23 @@ https://github.com/ARK-Electronics/pointperfect-client-mavlink/blob/main/config.
 ### Behavior
 The application waits for a MAVSDK connection, then for the first [GPS_RAW_INT](https://mavlink.io/en/messages/common.html#GPS_RAW_INT) of any `fix_type` (including no-fix). That signals the GPS driver has finished configuring the receiver and will inject `GPS_RTCM_DATA`, which matters for the one-shot AssistNow (MGA) burst billed at NTRIP connect. Only then does it open an NTRIP connection to the PointPerfect caster (`ppntrip.services.u-blox.com`, TLS on port `2102` or plain TCP on `2101`), authenticate with the per-Thing username/password, and request the mountpoint for the configured correction format.
 
+GPS_RAW_INT is also the receiver-presence signal, with a wrinkle: an autopilot with no GPS at all does not go quiet. PX4's stream sends a synthetic report once a second instead — `fix_type` 0, `UINT8_MAX` satellites, `UINT16_MAX` accuracies, and a zeroed position and timestamp. Those carry no receiver, so the client ignores them and presence means a real report within the last 3 seconds. Losing that closes the NTRIP connection: PX4 drops injected data until its GPS driver has the receiver configured again, so nothing sent during the outage arrives anyway. When real reports resume the client says so, reconnects, and the fix state starts over. That reconnect is also how the receiver gets assistance again — it came back without ephemeris, and the caster only delivers the AssistNow burst at connect.
+
 The caster provides *localized* corrections, so the client periodically reports the vehicle's position to it. After a continuous ≥2D fix for a few seconds, GPS_RAW_INT is converted to an NMEA-GGA sentence and sent to the caster every 10 seconds. MGA forwarding itself is not gated on fix — only on the receiver being up.
 
 The incoming correction stream is forwarded, unmodified, to the flight controller as [GPS_RTCM_DATA](https://mavlink.io/en/messages/common.html#GPS_RTCM_DATA) MAVLink messages (fragmented when larger than the message payload). The autopilot injects these bytes directly into the u-blox receiver to compute a high-precision fix.
+
+### Logging
+Connection lifecycle, MGA burst completion, and stable-fix transitions are logged as they happen. The correction stream itself is summarized every 30 seconds rather than logged per message:
+```
+Corrections: 5106 bytes received, 39 GPS_RTCM_DATA sent (last 30s)
+```
+The summary is printed even when nothing arrived, so a stalled caster is visible. Fix transitions are logged when the position actually starts or stops being reported, not while acquisition flaps, and a connect that keeps failing (no network at boot, bad credentials) is logged once a minute instead of on every 5 s retry.
+
+For per-message logging (every correction chunk, every forwarded MGA message and `GPS_RTCM_DATA`, every retry, and fix acquisition before the stable window):
+```toml
+verbose = true
+```
 
 ### Credentials
 From the Thingstream portal, open your PointPerfect *Thing* → **Credentials**. Copy the NTRIP server, port, username, and password into the config:

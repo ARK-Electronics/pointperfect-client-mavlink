@@ -38,6 +38,9 @@ private:
 	static constexpr size_t kFrameOverhead = 8; // sync(2) class id length(2) checksum(2)
 	static constexpr uint8_t kSync1 = 0xB5;
 	static constexpr uint8_t kSync2 = 0x62;
+	// Only UBX-MGA is pulled out of the stream. Any other class is correction
+	// data that happens to look like a frame, and stays in the passthrough.
+	static constexpr uint8_t kMgaClass = 0x13;
 
 	std::vector<uint8_t> _buffer;
 };

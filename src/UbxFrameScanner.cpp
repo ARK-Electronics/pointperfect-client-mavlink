@@ -30,6 +30,11 @@ void UbxFrameScanner::feed(const uint8_t* data, size_t length, const UbxHandler&
 			break; // length field not complete yet
 		}
 
+		if (_buffer[pos + 2] != kMgaClass) {
+			pos++; // not assistance data; leave it in the passthrough stream
+			continue;
+		}
+
 		const size_t payload_length = _buffer[pos + 4] | (size_t(_buffer[pos + 5]) << 8);
 
 		if (payload_length > kMaxPayloadLength) {

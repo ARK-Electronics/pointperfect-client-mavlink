@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <iosfwd>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <memory>
+#include <vector>
 
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
@@ -35,6 +37,9 @@ public:
 		// Request AssistNow (MGA) startup assistance for faster TTFF by using
 		// the *-MGA mountpoints. u-blox receivers only.
 		bool use_mga;
+		// Log every correction chunk and every forwarded message instead of a
+		// periodic throughput summary.
+		bool verbose;
 	};
 
 	PointPerfectClientMavlink(const Settings& settings);
@@ -51,19 +56,34 @@ private:
 	// GPS_RTCM_DATA carries at most 4 fragments of 180 bytes per sequence.
 	static constexpr size_t kMaxSequenceLength = 4 * MAVLINK_MSG_GPS_RTCM_DATA_FIELD_DATA_LEN;
 
-	// Pacing for the connect-time UBX-MGA burst (several KB at once): PX4
-	// drains gps_inject_data from an 8-deep queue, so an unpaced burst drops
-	// chunks before they reach the receiver.
-	static constexpr std::chrono::milliseconds kMgaMessageInterval{20};
+	// The autopilot's inject queue is 8-16 deep, drains only between receiver
+	// reads, and drops silently; 50ms covers a 16-deep queue across an 800ms stall.
+	static constexpr std::chrono::milliseconds kMgaMessageInterval{50};
 
 	// A partial frame candidate is flushed as raw data if the stream idles.
 	static constexpr std::chrono::seconds kScannerIdleFlush{2};
 
+	// Logged even when nothing arrived, so a stalled caster shows.
+	static constexpr std::chrono::seconds kStatsInterval{30};
+
+	// Failed connects retry every 5s; log one per minute.
+	static constexpr unsigned kConnectFailureLogEvery = 12;
+
+	// Receiver gone once GPS_RAW_INT stops this long (PX4 publishes only on a
+	// parsed report).
+	static constexpr std::chrono::seconds kGpsReceiverTimeout{3};
+
+	// AssistNow ephemeris only lives a few hours; older caches are refetched.
+	static constexpr std::chrono::hours kMgaCacheMaxAge{2};
+
+	// A stable fix lost this long means lost ephemeris; a flap recovers faster.
+	static constexpr std::chrono::seconds kFixLostReplayDelay{10};
+
 	bool wait_for_mavsdk_connection(double timeout_s);
-	// Blocks until the first GPS_RAW_INT (any fix_type), meaning the GPS
-	// driver is up and inject is safe. Returns false if exit was requested.
+	// Blocks until GPS_RAW_INT arrives (driver up, inject safe); false on exit.
 	bool wait_for_gps_receiver();
 	void handle_gps_raw_int(const mavlink_message_t& message);
+	bool gps_receiver_up() const;
 
 	// NTRIP transport
 	bool ntrip_connect();
@@ -84,12 +104,23 @@ private:
 	void send_sequence(const uint8_t* data, size_t length); // length <= kMaxSequenceLength
 	void send_mavlink_gps_rtcm_data(const mavlink_gps_rtcm_data_t& msg);
 
+	// Logging
+	void log_stats();         // periodic throughput summary, resets the counters
+	void report_mga_burst();  // one-shot, once the assistance burst is over
+	std::ostream& connect_log(); // stderr, or discarded while a retry is throttled
+
+	// The burst is billed per fetch: fetch once, serve restarts from memory.
+	void mark_mga_cache_complete();
+	void replay_mga_cache(); // paced; leaves the retry pending if cut short
+
 	// MAVSDK
 	std::shared_ptr<mavsdk::Mavsdk> _mavsdk;
 	std::shared_ptr<mavsdk::MavlinkPassthrough> _mavlink_passthrough;
 	uint8_t _sequence_id = 0;
 
 	// NTRIP socket / TLS
+	unsigned _connect_failures = 0; // consecutive; reset once a stream is up
+	bool _report_connect_failure = true; // this attempt's turn to be logged
 	int _socket_fd = -1;
 	SSL* _ssl = nullptr;
 	SSL_CTX* _ssl_ctx = nullptr;
@@ -106,20 +137,50 @@ private:
 		std::mutex lock;
 	} _position = {};
 
-	// Tracks continuous >=2D fix so we only report position after a stable window.
+	// Continuous >=2D fix window gating the GGA report.
 	std::optional<std::chrono::steady_clock::time_point> _fix_ok_since;
+	// Position is being reported; only transitions are logged (acquisition flaps).
+	bool _fix_reported = false;
 
-	// Set on the first GPS_RAW_INT of any fix_type. Used to delay NTRIP connect
-	// (and therefore the one-shot MGA burst) until the receiver is configured
-	// enough that the autopilot will inject GPS_RTCM_DATA to the device.
-	std::atomic<bool> _gps_receiver_seen{false};
+	// steady_clock ticks at the last real GPS_RAW_INT, 0 before the first —
+	// the receiver-presence signal. Callback thread writes, run() reads.
+	std::atomic<int64_t> _last_gps_raw_int{0};
 
 	// Splits UBX-MGA assistance out of the correction stream (MGA mountpoints).
 	UbxFrameScanner _scanner;
+	bool _fetching_assistance = false; // this connection is on the MGA mountpoint
+	// Per-read staging keeping assistance and corrections in separate sequences.
+	std::vector<uint8_t> _mga_staging;
+	std::vector<size_t> _mga_frame_lengths;
+	std::vector<uint8_t> _raw_staging;
 	std::chrono::steady_clock::time_point _last_stream_data{};
 	unsigned _mga_messages_forwarded = 0;
+	size_t _mga_bytes_forwarded = 0;
+	bool _mga_burst_reported = false;
+
+	// The fetched burst, one UBX-MGA message per entry; complete only once the
+	// stream moved past it (a fetch cut short is refetched).
+	std::vector<std::vector<uint8_t>> _mga_cache;
+	bool _mga_cache_complete = false;
+	std::chrono::steady_clock::time_point _mga_cache_time{};
+	// Receiver restarted; it is owed a replay.
+	std::atomic<bool> _mga_replay_pending{false};
+	// When a stable fix was lost, 0 while fixed; outlasting kFixLostReplayDelay
+	// schedules a replay.
+	std::atomic<int64_t> _fix_lost_since{0};
+	// Receiver time seen; time going away again means it restarted (a flap
+	// keeps time).
+	bool _gps_time_seen = false;
+
+	// Throughput since the last summary. Only touched from the run() thread.
+	struct Stats {
+		size_t rx_bytes;
+		unsigned tx_messages;
+	} _stats = {};
+	std::chrono::steady_clock::time_point _last_stats_log{};
 
 	Settings _settings;
-	std::string _mountpoint; // resolved from settings (explicit or format-derived)
+	std::string _mountpoint;     // corrections mountpoint (explicit or format-derived)
+	std::string _mountpoint_mga; // assistance mountpoint; empty when MGA is off
 	std::atomic<bool> _should_exit = false;
 };
